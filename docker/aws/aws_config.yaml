@@ -1,4 +1,5 @@
 server:
+  host: '*'
   port: 5432
 
 log: !Kafka
@@ -9,11 +10,15 @@ storage: !Remote
   objectStore: !S3
     bucket: !Env XTDB_S3_BUCKET
     prefix: "xtdb-object-store"
-  localDiskCache: /var/lib/xtdb/buffers
+
+diskCache:
+  path: /var/lib/xtdb/buffers
 
 healthz:
+  host: '*'
   port: 8080
 
 modules:
 - !HttpServer
+  host: '*'
   port: 3000

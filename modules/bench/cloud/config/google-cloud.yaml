@@ -1,4 +1,5 @@
 healthz:
+  host: '*'
   port: 8080
 
 log: !Local
@@ -9,5 +10,9 @@ storage: !Remote
     projectId: !Env XTDB_GCP_PROJECT_ID
     bucket: !Env XTDB_GCP_BUCKET
     prefix: "xtdb-object-store"
-  localDiskCache: /var/lib/xtdb/buffers/
-  maxDiskCachePercentage: 75
+
+diskCache:
+  path: /var/lib/xtdb/buffers/
+
+server:
+  host: '*'

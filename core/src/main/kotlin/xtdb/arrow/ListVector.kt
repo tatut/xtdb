@@ -16,19 +16,27 @@ import org.apache.arrow.vector.complex.ListVector as ArrowListVector
 
 internal val LIST: ArrowType.List = ArrowType.List.INSTANCE
 
-class ListVector(
-    private val allocator: BufferAllocator,
+class ListVector private constructor(
+    private val al: BufferAllocator,
     override var name: String, override var nullable: Boolean,
     private var elVector: Vector,
+    private val validityBuffer: ExtensibleBuffer,
+    private val offsetBuffer: ExtensibleBuffer,
     override var valueCount: Int = 0
 ) : Vector(), MetadataFlavour.List {
+
+    @JvmOverloads
+    constructor(
+        allocator: BufferAllocator, name: String, nullable: Boolean, elVector: Vector = NullVector("\$data$"),
+    ) : this(
+        allocator, name, nullable, elVector,
+        ExtensibleBuffer(allocator), ExtensibleBuffer(allocator)
+    )
 
     override val type: ArrowType = LIST
 
     override val vectors: Iterable<Vector> get() = listOf(elVector)
 
-    private val validityBuffer = ExtensibleBuffer(allocator)
-    private val offsetBuffer = ExtensibleBuffer(allocator)
 
     private var lastOffset: Int = 0
 
@@ -65,7 +73,7 @@ class ListVector(
                 try {
                     elVector.writeObject(el)
                 } catch (e: InvalidWriteObjectException) {
-                    elVector = DenseUnionVector.promote(allocator, elVector, e.obj.toFieldType())
+                    elVector = elVector.maybePromote(al, e.obj.toFieldType())
                     elVector.writeObject(el)
                 }
             }
@@ -77,7 +85,7 @@ class ListVector(
                 try {
                     elVector.writeValue(el)
                 } catch (e: InvalidWriteObjectException) {
-                    elVector = DenseUnionVector.promote(allocator, elVector, e.obj.toFieldType())
+                    elVector = DenseUnionVector.promote(al, elVector, e.obj.toFieldType())
                     elVector.writeValue(el)
                 }
             }
@@ -94,9 +102,9 @@ class ListVector(
             elVector.field.fieldType == fieldType -> elVector
 
             elVector is NullVector && elVector.valueCount == 0 ->
-                fromField(allocator, Field("\$data\$", fieldType, emptyList())).also { elVector = it }
+                fromField(al, Field("\$data\$", fieldType, emptyList())).also { elVector = it }
 
-            else -> TODO("promote elVector")
+            else -> elVector.maybePromote(al, fieldType).also { elVector = it }
         }
 
     override fun endList() = writeNotNull(elVector.valueCount - lastOffset)
@@ -152,7 +160,13 @@ class ListVector(
         valueCount = vec.valueCount
     }
 
-    override fun openSlice(al: BufferAllocator) = ListVector(al, name, nullable, elVector.openSlice(al), valueCount)
+    override fun openSlice(al: BufferAllocator) =
+        ListVector(
+            al, name, nullable, elVector.openSlice(al),
+            validityBuffer.openSlice(al),
+            offsetBuffer.openSlice(al),
+            valueCount
+        )
 
     override fun valueReader(pos: VectorPosition): ValueReader {
         val elPos = VectorPosition.build()

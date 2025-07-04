@@ -16,7 +16,7 @@ import xtdb.util.Hasher
 import xtdb.vector.extensions.SetType
 import xtdb.vector.extensions.SetVector
 
-interface IVectorWriter : ValueWriter, VectorWriter, AutoCloseable {
+interface IVectorWriter : VectorWriter, AutoCloseable {
     val vector: FieldVector
 
     override var valueCount: Int
@@ -35,6 +35,14 @@ interface IVectorWriter : ValueWriter, VectorWriter, AutoCloseable {
     fun syncValueCount() {
         vector.valueCount = this.valueCount
     }
+
+    override val asReader: VectorReader
+        get() {
+            syncValueCount()
+            return ValueVectorReader.from(vector)
+        }
+
+    override fun openDirectSlice(al: BufferAllocator) = asReader.openDirectSlice(al)
 
     // This is essentially the promoteChildren for monomorphic vectors except NullVector
     fun promoteChildren(field: Field) {
@@ -58,23 +66,9 @@ interface IVectorWriter : ValueWriter, VectorWriter, AutoCloseable {
         }
     }
 
+    override fun rowCopier(dest: VectorWriter) = unsupported("rowCopier(VectorWriter)")
+
     fun rowCopier(src: ValueVector): RowCopier
-
-    fun rowCopier(src: RelationReader): RowCopier {
-        val copiers = src.vectors.map {
-            it.rowCopier(vectorForOrNull(it.name) ?: vectorFor(it.name, it.fieldType))
-        }
-
-        return RowCopier { srcIdx ->
-            val pos = valueCount
-            copiers.forEach { it.copyRow(srcIdx) }
-            endStruct()
-            pos
-        }
-    }
-
-    override fun rowCopier0(src: VectorReader): RowCopier =
-        if (src is IVectorReader) src.rowCopier(this) else unsupported("IVectorWriter/rowCopier0")
 
     override fun writeUndefined() = TODO("writeUndefined on IVectorWriter...? could probably do this")
 
@@ -100,15 +94,12 @@ interface IVectorWriter : ValueWriter, VectorWriter, AutoCloseable {
     override fun vectorFor(name: String): IVectorWriter = vectorForOrNull(name) ?: error("missing vector: $name")
     override fun vectorFor(name: String, fieldType: FieldType): IVectorWriter = unsupported("vectorFor")
 
+    override fun openSlice(al: BufferAllocator) = asReader.openSlice(al)
+
     // New VectorWriters are also VectorReaders; old ones weren't, so we throw unsupported
     override fun hashCode(idx: Int, hasher: Hasher) = unsupported("IVectorWriter/hashCode")
     override fun isNull(idx: Int): Boolean = unsupported("IVectorWriter/isNull")
     override fun getObject(idx: Int, keyFn: IKeyFn<*>): Any? = unsupported("IVectorWriter/getObject")
-
-    fun append(v: IVectorReader) {
-        val copier = v.rowCopier(this)
-        repeat(v.valueCount) { copier.copyRow(it) }
-    }
 
     override fun clear() {
         vector.clear()
@@ -186,9 +177,3 @@ internal fun IVectorWriter.promote(fieldType: FieldType, al: BufferAllocator): F
         }
     }
 }
-
-internal val IVectorWriter.asReader: IVectorReader
-    get() {
-        syncValueCount()
-        return ValueVectorReader.from(vector)
-    }

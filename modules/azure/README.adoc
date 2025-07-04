@@ -10,7 +10,7 @@ In order to use any of the Azure services, you will need to include a dependency
 
 _deps.edn_
 ```
-com.xtdb.labs/xtdb-azure {:mvn/version "2.0.0-SNAPSHOT"}
+com.xtdb.labs/xtdb-azure {:mvn/version "2.x-SNAPSHOT"}
 ```
 
 _pom.xml_
@@ -18,7 +18,7 @@ _pom.xml_
 <dependency>
     <groupId>com.xtdb.labs</groupId>
     <artifactId>xtdb-azure</artifactId>
-    <version>2.0.0-SNAPSHOT</version>
+    <version>2.x-SNAPSHOT</version>
 </dependency>
 ```
 
@@ -36,8 +36,8 @@ To do so, we can add the `:azure` object store and it's configuration map, withi
 
 ```clojure
 {:storage [:remote {:object-store [:azure {:storage-account "xtdbstorageaccount"
-                                           :container "xtdb-object-store"}]
-                    :local-disk-cache "local-disk-cache"}]}
+                                           :container "xtdb-object-store"}]}]
+ :disk-cache {:path "local-disk-cache"}}
 ```
 
 Below follows the various parameters used by the module, and some notes around the provided <<resource-manager, Azure Resource Manager template>> which sets up all of the necessary infrastructure.

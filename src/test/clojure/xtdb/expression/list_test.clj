@@ -1,14 +1,13 @@
 (ns xtdb.expression.list-test
   (:require [clojure.test :as t]
-            [xtdb.error :as err]
             [xtdb.expression :as expr]
             [xtdb.expression.list :as list-expr]
-            [xtdb.types :as types]
             [xtdb.test-util :as tu]
+            [xtdb.types :as types]
             [xtdb.util :as util]
             [xtdb.vector.writer :as vw])
   (:import (org.apache.arrow.vector.types.pojo Field)
-           (xtdb.arrow ListExpression)))
+           (xtdb.arrow ListExpression Vector)))
 
 (t/use-fixtures :each tu/with-allocator)
 
@@ -20,11 +19,10 @@
               {:field field
                :size (some-> res (.getSize))
                :value (when res
-                        (util/with-open [out-vec (.createVector field tu/*allocator*)]
-                          (let [out-vec-writer (vw/->writer out-vec)]
-                            (.writeTo res out-vec-writer 0 (.getSize res))
-                            (vec (.toList (vw/vec-wtr->rdr out-vec-writer))))))}))]
-    (t/is (= {:field (types/col-type->field "i64" :i64)
+                        (util/with-open [out-vec (Vector/fromField tu/*allocator* field)]
+                          (.writeTo res out-vec 0 (.getSize res))
+                          (vec (.toList out-vec))))}))]
+    (t/is (= {:field (types/col-type->field "$data$" :i64)
               :size 10
               :value [1 2 3 4 5 6 7 8 9 10]}
              (run-test '(generate_series 1 11 1) {}))
@@ -60,10 +58,9 @@
         {:keys [->list-expr ^Field field]} (list-expr/compile-list-expr expr {})
         ^ListExpression list-expr (->list-expr {} {})
         run-write-test (fn [start count]
-                         (util/with-open [out-vec (.createVector field tu/*allocator*)]
-                           (let [out-vec-writer (vw/->writer out-vec)]
-                             (.writeTo list-expr out-vec-writer start count)
-                             (vec (.toList (vw/vec-wtr->rdr out-vec-writer))))))]
+                         (util/with-open [out-vec (tu/open-vec field)]
+                           (.writeTo list-expr out-vec start count)
+                           (vec (.toList (vw/vec-wtr->rdr out-vec)))))]
 
     (t/is (= [1 2 3 4 5 6 7 8 9 10]
              (run-write-test 0 (.getSize list-expr)))

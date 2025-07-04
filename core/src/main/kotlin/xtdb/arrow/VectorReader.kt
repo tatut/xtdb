@@ -1,6 +1,7 @@
 package xtdb.arrow
 
 import clojure.lang.ILookup
+import org.apache.arrow.memory.BufferAllocator
 import org.apache.arrow.memory.util.ArrowBufPointer
 import org.apache.arrow.vector.types.pojo.Field
 import org.apache.arrow.vector.types.pojo.FieldType
@@ -9,6 +10,7 @@ import xtdb.arrow.VectorIndirection.Companion.selection
 import xtdb.arrow.VectorIndirection.Companion.slice
 import xtdb.arrow.metadata.MetadataFlavour
 import xtdb.util.Hasher
+import xtdb.util.closeOnCatch
 import java.nio.ByteBuffer
 
 interface VectorReader : ILookup, AutoCloseable {
@@ -88,6 +90,11 @@ interface VectorReader : ILookup, AutoCloseable {
         override fun readObject() = getObject(pos.position)
     }
 
+    fun openSlice(al: BufferAllocator): VectorReader
+
+    fun openDirectSlice(al: BufferAllocator): Vector =
+        Vector.fromField(al, field).closeOnCatch { outVec -> outVec.also { it.append(this) } }
+
     fun select(idxs: IntArray): VectorReader = IndirectVector(this, selection(idxs))
     fun select(startIdx: Int, len: Int): VectorReader = IndirectVector(this, slice(startIdx, len))
 
@@ -96,14 +103,7 @@ interface VectorReader : ILookup, AutoCloseable {
 
     val metadataFlavours: Collection<MetadataFlavour> get() = unsupported("metadataFlavours")
 
-    fun rowCopier(dest: VectorWriter) =
-        if (dest is DenseUnionVector) dest.rowCopier0(this)
-        else {
-            val copier = dest.rowCopier0(this)
-            RowCopier { srcIdx ->
-                if (isNull(srcIdx)) valueCount.also { dest.writeNull() } else copier.copyRow(srcIdx)
-            }
-        }
+    fun rowCopier(dest: VectorWriter): RowCopier
 
     companion object {
         fun toString(reader: VectorReader): String = reader.run {

@@ -25,17 +25,15 @@
            (java.nio ByteBuffer)
            (java.time Instant InstantSource)
            (java.time.temporal ChronoUnit)
-           (java.util.function Consumer)
            (org.apache.arrow.memory BufferAllocator)
            (org.apache.arrow.vector.ipc ArrowReader ArrowStreamReader)
            (org.apache.arrow.vector.types.pojo FieldType)
            xtdb.api.TransactionKey
-           (xtdb.arrow RowCopier VectorReader)
+           (xtdb.arrow RelationAsStructReader RelationReader RowCopier SingletonListReader VectorReader)
            xtdb.BufferPool
            (xtdb.error Anomaly$Caller Interrupted)
            (xtdb.indexer IIndexer LiveIndex LiveIndex$Tx LiveTable$Tx OpIndexer RelationIndexer Watermark Watermark$Source)
-           (xtdb.query IQuerySource PreparedQuery)
-           (xtdb.vector IVectorReader RelationAsStructReader RelationReader SingletonListReader)))
+           (xtdb.query IQuerySource PreparedQuery)))
 
 (set! *unchecked-math* :warn-on-boxed)
 
@@ -54,14 +52,15 @@
                   (ByteBuffer/wrap (.getBytes crash-edn))))
 
     (when live-table-tx
-      (with-open [live-rel (.openAsRelation (doto (.getLiveRelation live-table-tx)
-                                              (.syncRowCount)))
+      (with-open [live-rel (.openDirectSlice (doto (.getLiveRelation live-table-tx)
+                                               (.syncRowCount))
+                                             allocator)
                   wtr (.openArrowWriter buffer-pool (.resolve crash-dir "live-table.arrow") live-rel)]
         (.writePage wtr)
         (.end wtr)))
 
     (when query-rel
-      (with-open [query-rel (.openAsRelation query-rel allocator)
+      (with-open [query-rel (.openDirectSlice query-rel allocator)
                   wtr (.openArrowWriter buffer-pool (.resolve crash-dir "query-rel.arrow") query-rel)]
         (.writePage wtr)
         (.end wtr)))
@@ -95,7 +94,7 @@
                              :col-type (types/field->col-type (.getField rdr))}))))
 
 (defn- ->put-docs-indexer ^xtdb.indexer.OpIndexer [^LiveIndex$Tx live-idx-tx,
-                                                   ^IVectorReader tx-ops-rdr, ^Instant system-time
+                                                   ^VectorReader tx-ops-rdr, ^Instant system-time
                                                    {:keys [indexer tx-key]}]
   (let [put-leg (.vectorFor tx-ops-rdr "put-docs")
         iids-rdr (.vectorFor put-leg "iids")
@@ -103,9 +102,9 @@
         docs-rdr (.vectorFor put-leg "documents")
 
         ;; HACK: can remove this once we're sure a few more people have migrated their logs
-        ^IVectorReader valid-from-rdr (or (.vectorForOrNull put-leg "_valid_from")
-                                          (when (.vectorForOrNull put-leg "xt$valid_from")
-                                            (throw (err/fault ::legacy-log "Legacy log format - see https://github.com/xtdb/xtdb/pull/3675 for more details"))))
+        ^VectorReader valid-from-rdr (or (.vectorForOrNull put-leg "_valid_from")
+                                         (when (.vectorForOrNull put-leg "xt$valid_from")
+                                           (throw (err/fault ::legacy-log "Legacy log format - see https://github.com/xtdb/xtdb/pull/3675 for more details"))))
 
         valid-to-rdr (.vectorFor put-leg "_valid_to")
         system-time-µs (time/instant->micros system-time)
@@ -123,10 +122,12 @@
                                                                 {::err/message (str "Cannot put documents with columns: " (pr-str forbidden-cols))
                                                                  :table-name table-name
                                                                  :forbidden-cols forbidden-cols})))
-                                      (let [^RelationReader table-rel-rdr (vr/rel-reader (for [^String sk ks,
-                                                                                               :when (not (contains? #{"_valid_from" "_valid_to"} sk))]
-                                                                                           (.vectorFor doc-rdr sk))
-                                                                                         (.getValueCount doc-rdr))
+                                      (let [table-doc-rdr (RelationAsStructReader.
+                                                           "docs"
+                                                           (vr/rel-reader (for [^String sk ks,
+                                                                                :when (not (contains? #{"_valid_from" "_valid_to"} sk))]
+                                                                            (.vectorFor doc-rdr sk))
+                                                                          (.getValueCount doc-rdr)))
                                             live-table-tx (.liveTable live-idx-tx table-name)]
                                         (MapEntry/create table-name
                                                          {:id-rdr (.vectorFor doc-rdr "_id")
@@ -140,15 +141,15 @@
 
                                                           :docs-rdr table-docs-rdr
 
-                                                          :doc-copier (-> (.getDocWriter live-table-tx)
-                                                                          (.rowCopier table-rel-rdr))})))))))]
+                                                          :doc-copier (.rowCopier table-doc-rdr
+                                                                                  (.getDocWriter live-table-tx))})))))))]
 
     (reify OpIndexer
       (indexOp [_ tx-op-idx]
         (let [table-name (.getLeg docs-rdr tx-op-idx)
 
-              {:keys [^IVectorReader docs-rdr, ^IVectorReader id-rdr, ^LiveTable$Tx live-table-tx, ^RowCopier doc-copier
-                      ^IVectorReader row-valid-from-rdr, ^IVectorReader row-valid-to-rdr]}
+              {:keys [^VectorReader docs-rdr, ^VectorReader id-rdr, ^LiveTable$Tx live-table-tx, ^RowCopier doc-copier
+                      ^VectorReader row-valid-from-rdr, ^VectorReader row-valid-to-rdr]}
               (get tables table-name)
 
               valid-from (if (.isNull valid-from-rdr tx-op-idx)
@@ -189,7 +190,7 @@
 
         nil))))
 
-(defn- ->delete-docs-indexer ^xtdb.indexer.OpIndexer [^LiveIndex$Tx live-idx-tx, ^IVectorReader tx-ops-rdr, ^Instant current-time
+(defn- ->delete-docs-indexer ^xtdb.indexer.OpIndexer [^LiveIndex$Tx live-idx-tx, ^VectorReader tx-ops-rdr, ^Instant current-time
                                                       {:keys [indexer tx-key]}]
   (let [delete-leg (.vectorFor tx-ops-rdr "delete-docs")
         table-rdr (.vectorFor delete-leg "table")
@@ -227,7 +228,7 @@
 
         nil))))
 
-(defn- ->erase-docs-indexer ^xtdb.indexer.OpIndexer [^LiveIndex$Tx live-idx-tx, ^IVectorReader tx-ops-rdr
+(defn- ->erase-docs-indexer ^xtdb.indexer.OpIndexer [^LiveIndex$Tx live-idx-tx, ^VectorReader tx-ops-rdr
                                                      {:keys [indexer tx-key]}]
   (let [erase-leg (.vectorFor tx-ops-rdr "erase-docs")
         table-rdr (.vectorFor erase-leg "table")
@@ -257,9 +258,9 @@
     (reify RelationIndexer
       (indexOp [_ in-rel {:keys [table]}]
         (let [row-count (.getRowCount in-rel)
-              ^RelationReader content-rel (vr/rel-reader (->> in-rel
-                                                              (remove (comp types/temporal-column? #(.getName ^IVectorReader %))))
-                                                         (.getRowCount in-rel))
+              content-rel (vr/rel-reader (->> in-rel
+                                              (remove (comp types/temporal-column? #(.getName ^VectorReader %))))
+                                         (.getRowCount in-rel))
               table (str table)
 
               _ (when (xt-log/forbidden-table? table) (throw (xt-log/forbidden-table-ex table)))
@@ -273,12 +274,12 @@
           (with-crash-log indexer "error upserting rows"
               {:table-name table, :tx-key tx-key}
               {:live-table-tx live-table-tx, :query-rel in-rel}
-            (let [live-idx-table-copier (-> (.getDocWriter live-table-tx)
-                                            (.rowCopier content-rel))]
+            (let [live-idx-table-copier (.rowCopier (RelationAsStructReader. "content" content-rel)
+                                                    (.getDocWriter live-table-tx))]
               (when-not id-col
                 (throw (err/incorrect :xtdb.indexer/missing-xt-id-column
                                       "Missing ID column"
-                                      {:column-names (vec (for [^IVectorReader col in-rel] (.getName col)))})))
+                                      {:column-names (vec (for [^VectorReader col in-rel] (.getName col)))})))
 
               (dotimes [idx row-count]
                 (err/wrap-anomaly {:table-name table, :tx-key tx-key, :row-idx idx}
@@ -357,11 +358,9 @@
         (letfn [(throw-assert-failed []
                   (throw (err/conflict :xtdb/assert-failed (or message "Assert failed"))))]
           (or (.tryAdvance res
-                           (reify Consumer
-                             (accept [_ in-rel]
-                               (let [^RelationReader in-rel in-rel]
-                                 (when-not (pos? (.getRowCount in-rel))
-                                   (throw-assert-failed))))))
+                           (fn [^RelationReader in-rel]
+                             (when-not (pos? (.getRowCount in-rel))
+                               (throw-assert-failed))))
 
               (throw-assert-failed)))
 
@@ -375,11 +374,10 @@
                                              (assoc :args args, :close-args? false))))]
 
         (.forEachRemaining res
-                           (reify Consumer
-                             (accept [_ in-rel]
-                               (.indexOp rel-idxer in-rel query-opts))))))))
+                           (fn [in-rel]
+                             (.indexOp rel-idxer in-rel query-opts)))))))
 
-(defn- open-args-rdr ^org.apache.arrow.vector.ipc.ArrowReader [^BufferAllocator allocator, ^IVectorReader args-rdr, ^long tx-op-idx]
+(defn- open-args-rdr ^org.apache.arrow.vector.ipc.ArrowReader [^BufferAllocator allocator, ^VectorReader args-rdr, ^long tx-op-idx]
   (when-not (.isNull args-rdr tx-op-idx)
     (let [is (ByteArrayInputStream. (.array ^ByteBuffer (.getObject args-rdr tx-op-idx)))] ; could try to use getBytes
       (ArrowStreamReader. is allocator))))
@@ -413,7 +411,7 @@
                  (.getLong to-rdr idx)
                  #(.copyRow doc-copier idx))))))
 
-(defn- ->patch-docs-indexer [^LiveIndex$Tx live-idx-tx, ^IVectorReader tx-ops-rdr,
+(defn- ->patch-docs-indexer [^LiveIndex$Tx live-idx-tx, ^VectorReader tx-ops-rdr,
                              ^IQuerySource q-src, wm-src,
                              {:keys [snapshot-time] :as tx-opts}]
   (let [patch-leg (.vectorFor tx-ops-rdr "patch-docs")
@@ -499,7 +497,7 @@
                                 {:param-count param-count, :arg-count arg-count}))
 
           (f (vr/rel-reader (->> args
-                                 (map-indexed (fn [idx ^IVectorReader col]
+                                 (map-indexed (fn [idx ^VectorReader col]
                                                 (.withName col (str "?_" idx))))))))))))
 
 (def ^:private ^:const ^String user-table "pg_catalog/pg_user")
@@ -527,7 +525,7 @@
                (.endStruct doc-writer)))))
 
 (defn- ->sql-indexer ^xtdb.indexer.OpIndexer [^BufferAllocator allocator, ^LiveIndex$Tx live-idx-tx
-                                              ^IVectorReader tx-ops-rdr, ^IQuerySource q-src, wm-src,
+                                              ^VectorReader tx-ops-rdr, ^IQuerySource q-src, wm-src,
                                               {:keys [tx-key] :as tx-opts}]
   (let [sql-leg (.vectorFor tx-ops-rdr "sql")
         query-rdr (.vectorFor sql-leg "query")

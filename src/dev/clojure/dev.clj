@@ -16,10 +16,10 @@
   (:import [java.nio.file Path]
            java.time.Duration
            [java.util List]
-           [org.apache.arrow.memory BaseAllocator RootAllocator]
+           [org.apache.arrow.memory RootAllocator]
            [org.apache.arrow.vector.ipc ArrowFileReader]
            org.roaringbitmap.buffer.ImmutableRoaringBitmap
-           (xtdb.arrow Relation StructVector Vector)
+           (xtdb.arrow Relation Vector)
            (xtdb.block.proto TableBlock)
            (xtdb.log.proto TrieDetails)
            (xtdb.trie ArrowHashTrie ArrowHashTrie$IidBranch ArrowHashTrie$Leaf ArrowHashTrie$Node)))
@@ -96,17 +96,11 @@
       (time (tu/query-ra @!q node)))))
 
 
-(defn data->struct-vec [^BaseAllocator alloc data]
-  (util/with-close-on-catch [^StructVector struct-vec (Vector/fromField alloc (types/col-type->field "my-struct" [:struct {}]))]
-    (doseq [row data]
-      (.writeObject struct-vec row))
-    struct-vec))
-
-(defn write-arrow-file [^Path path data]
+(defn write-arrow-file [^Path path, ^List data]
   (with-open [al (RootAllocator.)
               ch (util/->file-channel path #{:write :create})
-              ^StructVector struct-vec (data->struct-vec al data)]
-    (let [rel (Relation. ^List (into [] (.getVectors struct-vec)) (.getValueCount struct-vec))]
+              struct-vec (Vector/fromList al (types/col-type->field "my-struct" [:struct {}]) data)]
+    (let [rel (Relation. al ^List (into [] (.getVectors struct-vec)) (.getValueCount struct-vec))]
       (with-open [unloader (.startUnload rel ch)]
         (.writePage unloader)
         (.end unloader)))))

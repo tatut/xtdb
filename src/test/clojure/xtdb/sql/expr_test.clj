@@ -147,7 +147,7 @@
   (t/is (= '(octet-length f/a) (plan-expr-with-foo "CHAR_LENGTH(foo.a USING OCTETS)")) "CHAR_LENGTH alias works"))
 
 (t/deftest test-octet-length-expr
-  (t/is (= '(octet-length f/a) (plan-expr-with-foo "OCTET_LENGTH(foo.a)"))))
+  (t/is (= '(octet_length f/a) (plan-expr-with-foo "OCTET_LENGTH(foo.a)"))))
 
 (t/deftest test-position-expr
   (t/is (= '(position f/a f/b) (plan-expr-with-foo "POSITION(foo.a IN foo.b)")))
@@ -770,8 +770,8 @@
     "LOCALTIMESTAMP(6)" '(local-timestamp 6)))
 
 (t/deftest test-current-setting-server-version-num
-  (with-redefs [xtdb.expression/xtdb-server-version (fn [] "2.0.0-SNAPSHOT")]
-    (t/is (= [{:v 2000000}]
+  (with-redefs [xtdb.expression/xtdb-server-version (fn [] "2.0.4-SNAPSHOT")]
+    (t/is (= [{:v 2000004}]
              (xt/q tu/*node* "SELECT current_setting('server_version_num') AS v"))))
 
   (t/is (anomalous? [:unsupported ::expr/unsupported-setting]

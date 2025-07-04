@@ -1,17 +1,22 @@
 package xtdb.arrow
 
 import clojure.lang.*
+import org.apache.arrow.memory.BufferAllocator
+import org.apache.arrow.vector.VectorSchemaRoot
 import org.apache.arrow.vector.types.pojo.Schema
 import xtdb.api.query.IKeyFn
 import xtdb.api.query.IKeyFn.KeyFn.KEBAB_CASE_KEYWORD
 import xtdb.util.closeAll
+import xtdb.util.closeAllOnCatch
+import xtdb.util.safeMap
+import xtdb.vector.ValueVectorReader
 import java.util.*
 
 interface RelationReader : ILookup, Seqable, Counted, AutoCloseable {
-    val schema: Schema
+    val schema: Schema get() = Schema(vectors.map { it.field })
     val rowCount: Int
 
-    val vectors: Iterable<VectorReader>
+    val vectors: Collection<VectorReader>
 
     fun vectorForOrNull(name: String): VectorReader?
     fun vectorFor(name: String) = vectorForOrNull(name) ?: error("missing vector: $name")
@@ -19,6 +24,16 @@ interface RelationReader : ILookup, Seqable, Counted, AutoCloseable {
 
     operator fun get(idx: Int, keyFn: IKeyFn<*> = KEBAB_CASE_KEYWORD): Map<*, Any?> =
         vectors.associate { keyFn.denormalize(it.name) to it.getObject(idx, keyFn) }
+
+    fun openSlice(al: BufferAllocator): RelationReader =
+        vectors
+            .safeMap { it.openSlice(al) }
+            .closeAllOnCatch { slicedVecs -> from(slicedVecs, rowCount) }
+
+    fun openDirectSlice(al: BufferAllocator) =
+        vectors
+            .safeMap { it.openDirectSlice(al) }
+            .closeAllOnCatch { vectors -> Relation(al, vectors, rowCount) }
 
     fun select(idxs: IntArray): RelationReader = from(vectors.map { it.select(idxs) }, idxs.size)
     fun select(startIdx: Int, len: Int): RelationReader = from(vectors.map { it.select(startIdx, len) }, len)
@@ -46,20 +61,33 @@ interface RelationReader : ILookup, Seqable, Counted, AutoCloseable {
             ) as Map<*, *>
         }
 
-    class FromCols(private val cols: SequencedMap<String, VectorReader>, override val rowCount: Int) : RelationReader {
-        override val schema get() = Schema(cols.values.map { it.field })
-
+    private class FromCols(
+        private val cols: SequencedMap<String, VectorReader>, override val rowCount: Int
+    ) : RelationReader {
         override fun vectorForOrNull(name: String) = cols[name]
         override val vectors get() = cols.values
-
-        override fun select(idxs: IntArray): RelationReader =
-            FromCols(cols.entries.associateTo(linkedMapOf()) { it.key to it.value.select(idxs) }, idxs.size)
     }
 
     companion object {
         @JvmStatic
         fun from(cols: Iterable<VectorReader>, rowCount: Int): RelationReader =
             FromCols(cols.associateByTo(linkedMapOf()) { it.name }, rowCount)
+
+        @JvmStatic
+        fun from(root: VectorSchemaRoot): RelationReader =
+            from(
+                root.fieldVectors.map { v -> ValueVectorReader.from(v) },
+                root.rowCount
+            )
+
+        @JvmStatic
+        fun concatCols(rel1: RelationReader, rel2: RelationReader): RelationReader {
+            if (rel1.vectors.isEmpty()) return rel2
+            if (rel2.vectors.isEmpty()) return rel1
+            assert(rel1.rowCount == rel2.rowCount) { "Cannot concatenate relations with different row counts" }
+
+            return from(rel1.vectors + rel2.vectors, rel1.rowCount)
+        }
 
         @Suppress("unused")
         @JvmField

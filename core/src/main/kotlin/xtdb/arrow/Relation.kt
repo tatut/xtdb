@@ -1,5 +1,7 @@
 package xtdb.arrow
 
+import clojure.lang.Keyword
+import clojure.lang.Symbol
 import org.apache.arrow.flatbuf.Footer.getRootAsFooter
 import org.apache.arrow.flatbuf.MessageHeader
 import org.apache.arrow.memory.ArrowBuf
@@ -11,15 +13,21 @@ import org.apache.arrow.vector.ipc.SeekableReadChannel
 import org.apache.arrow.vector.ipc.WriteChannel
 import org.apache.arrow.vector.ipc.message.*
 import org.apache.arrow.vector.types.pojo.Field
+import org.apache.arrow.vector.types.pojo.FieldType
 import org.apache.arrow.vector.types.pojo.Schema
 import xtdb.ArrowWriter
 import xtdb.arrow.ArrowUtil.arrowBufToRecordBatch
 import xtdb.arrow.Relation.UnloadMode.FILE
 import xtdb.arrow.Relation.UnloadMode.STREAM
 import xtdb.arrow.Vector.Companion.fromField
+import xtdb.toFieldType
 import xtdb.trie.FileSize
 import xtdb.types.NamelessField
 import xtdb.util.closeAll
+import xtdb.util.closeAllOnCatch
+import xtdb.util.closeOnCatch
+import xtdb.util.normalForm
+import xtdb.util.safeMap
 import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
 import java.nio.channels.*
@@ -30,30 +38,28 @@ import java.util.*
 
 private val MAGIC = "ARROW1".toByteArray()
 
-class Relation(val vecs: SequencedMap<String, Vector>, override var rowCount: Int = 0) : RelationWriter {
+class Relation(
+    private val al: BufferAllocator, val vecs: SequencedMap<String, Vector>, override var rowCount: Int
+) : RelationWriter {
 
     override val schema get() = Schema(vecs.sequencedValues().map { it.field })
     override val vectors get() = vecs.values
 
-    @JvmOverloads
-    constructor(vectors: List<Vector>, rowCount: Int = 0)
-            : this(vectors.associateByTo(linkedMapOf()) { it.name }, rowCount)
+    constructor(al: BufferAllocator) : this(al, linkedMapOf<String, Vector>(), 0)
 
-    @JvmOverloads
-    constructor(allocator: BufferAllocator, schema: Schema, rowCount: Int = 0)
-            : this(allocator, schema.fields, rowCount)
-
-    @JvmOverloads
-    constructor(allocator: BufferAllocator, fields: List<Field>, rowCount: Int = 0)
-            : this(fields.map { fromField(allocator, it) }, rowCount)
-
-    @JvmOverloads
-    constructor(allocator: BufferAllocator, fields: SequencedMap<String, NamelessField>, rowCount: Int = 0)
-            : this(allocator, fields.map { (name, field) -> field.toArrowField(name) }, rowCount)
+    constructor(al: BufferAllocator, vectors: List<Vector>, rowCount: Int)
+            : this(al, vectors.associateByTo(linkedMapOf()) { it.name }, rowCount)
 
     override fun vectorForOrNull(name: String) = vecs[name]
     override fun vectorFor(name: String) = vectorForOrNull(name) ?: error("missing vector: $name")
     override operator fun get(name: String) = vectorFor(name)
+
+    override fun vectorFor(name: String, fieldType: FieldType): Vector =
+        vecs.compute(name) { _, v ->
+            v?.maybePromote(al, fieldType)
+                ?: fromField(al, Field(name, fieldType, null))
+                    .also { vec -> repeat(rowCount) { vec.writeNull() } }
+        }!!
 
     override fun endRow() =
         (++rowCount).also { rowCount ->
@@ -61,15 +67,6 @@ class Relation(val vecs: SequencedMap<String, Vector>, override var rowCount: In
                 repeat(rowCount - vec.valueCount) { vec.writeNull() }
             }
         }
-
-    override fun rowCopier(rel: RelationReader): RowCopier {
-        val copiers = rel.vectors.map { it.rowCopier(vecs[it.name] ?: error("missing ${it.name} vector")) }
-
-        return RowCopier { srcIdx ->
-            copiers.forEach { it.copyRow(srcIdx) }
-            endRow()
-        }
-    }
 
     fun loadFromArrow(root: VectorSchemaRoot) {
         vecs.forEach { (name, vec) -> vec.loadFromArrow(root.getVector(name)) }
@@ -226,7 +223,7 @@ class Relation(val vecs: SequencedMap<String, Vector>, override var rowCount: In
 
         private var lastPageIndex = -1
 
-        fun loadPage(idx: Int, al: BufferAllocator) = Relation(al, schema).also { loadPage(idx, it) }
+        fun loadPage(idx: Int, al: BufferAllocator) = open(al, schema).also { loadPage(idx, it) }
 
         fun loadPage(idx: Int, rel: Relation) {
             pages[idx].load(rel)
@@ -352,15 +349,44 @@ class Relation(val vecs: SequencedMap<String, Vector>, override var rowCount: In
         }
 
         @JvmStatic
-        fun fromRoot(vsr: VectorSchemaRoot) = Relation(vsr.fieldVectors.map(Vector::fromArrow), vsr.rowCount)
+        fun fromRoot(al: BufferAllocator, vsr: VectorSchemaRoot) =
+            Relation(al, vsr.fieldVectors.map(Vector::fromArrow), vsr.rowCount)
 
         @JvmStatic
         fun fromRecordBatch(allocator: BufferAllocator, schema: Schema, recordBatch: ArrowRecordBatch): Relation {
-            val rel = Relation(allocator, schema)
+            val rel = open(allocator, schema)
             // this load retains the buffers
             rel.load(recordBatch)
             return rel
         }
+
+        @JvmStatic
+        fun open(al: BufferAllocator, schema: Schema) = open(al, schema.fields)
+
+        @JvmStatic
+        fun open(al: BufferAllocator, fields: List<Field>) =
+            Relation(al, fields.map { fromField(al, it) }, 0)
+
+        @JvmStatic
+        fun open(al: BufferAllocator, fields: SequencedMap<String, NamelessField>) =
+            open(al, fields.map { (name, field) -> field.toArrowField(name) })
+
+        @JvmStatic
+        fun openFromRows(al: BufferAllocator, rows: List<Map<*, *>>): Relation =
+            Relation(al).closeOnCatch { rel -> rel.also { for (row in rows) it.writeRow(row) } }
+
+        @JvmStatic
+        fun openFromCols(al: BufferAllocator, cols: Map<*, List<*>>): Relation =
+            cols.entries.safeMap { col ->
+                val normalKey = when (val k = col.key) {
+                    is String -> k
+                    is Symbol -> normalForm(k).toString()
+                    is Keyword -> normalForm(k.sym).toString()
+                    else -> throw IllegalArgumentException("Column name must be a string, keyword or symbol")
+                }
+
+                Vector.fromList(al,normalKey, col.value)
+            }.closeAllOnCatch { Relation(al, it, it.firstOrNull()?.valueCount ?: 0) }
     }
 
     /**

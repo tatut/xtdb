@@ -21,7 +21,10 @@ import xtdb.aws.CloudWatchMetrics
 import xtdb.aws.S3.Companion.s3
 import xtdb.azure.AzureMonitorMetrics
 import xtdb.azure.BlobStorage.Companion.azureBlobStorage
+import xtdb.cache.DiskCache
 import xtdb.gcp.CloudStorage.Companion.googleCloudStorage
+import xtdb.util.asPath
+import java.net.InetAddress
 import java.nio.file.Paths
 
 class YamlSerdeTest {
@@ -44,7 +47,8 @@ class YamlSerdeTest {
         log: !InMemory
         storage: !Local
             path: local-storage
-            maxCacheEntries: 1025
+        memoryCache:
+            maxSizeBytes: 1025
         indexer:
             logLimit: 65
             flushDuration: PT4H
@@ -79,7 +83,10 @@ class YamlSerdeTest {
             connectionString: "InstrumentationKey=00000000-0000-0000-0000-000000000000;" 
         """.trimIndent()
 
-        assertEquals("InstrumentationKey=00000000-0000-0000-0000-000000000000;", nodeConfig(azureInput).findModule<AzureMonitorMetrics>()?.connectionString)
+        assertEquals(
+            "InstrumentationKey=00000000-0000-0000-0000-000000000000;",
+            nodeConfig(azureInput).findModule<AzureMonitorMetrics>()?.connectionString
+        )
     }
 
     @Test
@@ -136,15 +143,23 @@ class YamlSerdeTest {
             objectStore: !S3
               bucket: !Env S3_BUCKET
               prefix: xtdb-object-store
-            localDiskCache: test-path
+              
+        diskCache: 
+            path: test-path
         """.trimIndent()
+
+        val s3NodeConfig = nodeConfig(s3Config)
 
         assertEquals(
             RemoteStorageFactory(
                 objectStore = s3(bucket = "xtdb-bucket").prefix(Paths.get("xtdb-object-store")),
-                localDiskCache = Paths.get("test-path")
             ),
-            nodeConfig(s3Config).storage
+            s3NodeConfig.storage
+        )
+
+        assertEquals(
+            DiskCache.Factory("test-path".asPath),
+            s3NodeConfig.diskCache
         )
 
         every { EnvironmentVariableProvider.getEnvVariable("AZURE_STORAGE_ACCOUNT") } returns "storage-account"
@@ -155,7 +170,6 @@ class YamlSerdeTest {
               storageAccount: !Env AZURE_STORAGE_ACCOUNT
               container: xtdb-container
               prefix: xtdb-object-store
-            localDiskCache: test-path
         """.trimIndent()
 
         assertEquals(
@@ -164,7 +178,6 @@ class YamlSerdeTest {
                     storageAccount = "storage-account",
                     container = "xtdb-container"
                 ).prefix(Paths.get("xtdb-object-store")),
-                localDiskCache = Paths.get("test-path")
             ),
             nodeConfig(azureConfig).storage
         )
@@ -177,16 +190,14 @@ class YamlSerdeTest {
             projectId: !Env GCP_PROJECT_ID
             bucket: xtdb-bucket
             prefix: xtdb-object-store
-          localDiskCache: test-path
         """.trimIndent()
 
         assertEquals(
             RemoteStorageFactory(
                 objectStore = googleCloudStorage(
                     projectId = "xtdb-project",
-                    bucket ="xtdb-bucket",
+                    bucket = "xtdb-bucket",
                 ).prefix(Paths.get("xtdb-object-store")),
-                localDiskCache = Paths.get("test-path")
             ),
             nodeConfig(googleCloudConfig).storage
         )
@@ -255,16 +266,20 @@ class YamlSerdeTest {
         storage: !Remote
             objectStore: !S3
               bucket: !Env BUCKET 
-            localDiskCache: !Env DISK_CACHE_PATH
+        diskCache: 
+            path: !Env DISK_CACHE_PATH
         """.trimIndent()
 
-        assertEquals(
-            RemoteStorageFactory(
-                objectStore = s3(bucket = "xtdb-bucket"),
-                localDiskCache = Paths.get("test-path")
-            ),
+        val nodeConfig = nodeConfig(inputWithEnv)
 
-            nodeConfig(inputWithEnv).storage
+        assertEquals(
+            RemoteStorageFactory(objectStore = s3(bucket = "xtdb-bucket")),
+            nodeConfig.storage
+        )
+
+        assertEquals(
+            DiskCache.Factory("test-path".asPath),
+            nodeConfig.diskCache
         )
 
         unmockkObject(EnvironmentVariableProvider)
@@ -339,6 +354,39 @@ class YamlSerdeTest {
                 )
             ),
             nodeConfig(input).authn
+        )
+    }
+
+    @Test
+    fun testHost() {
+        assertEquals(
+            ServerConfig().host(InetAddress.getByName("localhost")),
+            nodeConfig(
+                """
+                    server: 
+                      host: localhost
+                """.trimIndent()
+            ).server
+        )
+
+        assertEquals(
+            ServerConfig().host(InetAddress.getByName("127.0.0.1")),
+            nodeConfig(
+                """
+                    server: 
+                      host: 127.0.0.1
+                """.trimIndent()
+            ).server
+        )
+
+        assertEquals(
+            ServerConfig().host(InetAddress.getByName("::")),
+            nodeConfig(
+                """
+                    server: 
+                      host: '::'
+                """.trimIndent()
+            ).server
         )
     }
 }

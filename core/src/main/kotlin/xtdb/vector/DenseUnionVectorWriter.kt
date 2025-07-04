@@ -109,14 +109,6 @@ class DenseUnionVectorWriter(
             }
         }
 
-        override fun rowCopier(src: RelationReader): RowCopier {
-            val innerCopier = inner.rowCopier(src)
-
-            return RowCopier { srcIdx ->
-                writeValue()
-                innerCopier.copyRow(srcIdx)
-            }
-        }
     }
 
     private fun upsertChildField(childField: Field) {

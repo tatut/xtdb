@@ -9,13 +9,13 @@
             xtdb.expression.temporal
             xtdb.expression.uri
             [xtdb.logical-plan :as lp]
-            [xtdb.metadata :as meta]
             [xtdb.metrics :as metrics]
             xtdb.operator.apply
             xtdb.operator.arrow
             xtdb.operator.csv
             xtdb.operator.group-by
             xtdb.operator.join
+            xtdb.operator.list
             xtdb.operator.order-by
             xtdb.operator.patch
             xtdb.operator.project
@@ -83,19 +83,18 @@
       (util/close wm)
       (util/close al))))
 
-(defn emit-expr [^ConcurrentHashMap cache {:keys [^IScanEmitter scan-emitter, ^BlockCatalog block-cat, ^Watermark$Source wm-src]}
-                 conformed-query scan-cols default-tz param-fields]
+(defn emit-expr [^ConcurrentHashMap cache {:keys [^IScanEmitter scan-emitter, ^BlockCatalog block-cat, table-cat]} wm
+                 conformed-query scan-cols
+                 default-tz param-fields]
   (.computeIfAbsent cache
-                    {:scan-fields (when (and (seq scan-cols) scan-emitter)
-                                    (with-open [wm (.openWatermark wm-src)]
-                                      (.scanFields scan-emitter wm scan-cols)))
+                    {:scan-fields (when (seq scan-cols)
+                                    (scan/scan-fields table-cat wm scan-cols))
                      :default-tz default-tz
                      :last-known-block (some-> block-cat .getCurrentBlockIndex)
                      :param-fields param-fields}
-                    (reify Function
-                      (apply [_ emit-opts]
-                        (binding [expr/*default-tz* default-tz]
-                          (lp/emit-expr conformed-query (assoc emit-opts :scan-emitter scan-emitter)))))))
+                    (fn [emit-opts]
+                      (binding [expr/*default-tz* default-tz]
+                        (lp/emit-expr conformed-query (assoc emit-opts :scan-emitter scan-emitter))))))
 
 (defn- ->result-fields [ordered-outer-projection fields]
   (if ordered-outer-projection
@@ -130,9 +129,8 @@
   (^xtdb.query.PreparedQuery [query deps] (prepare-ra query deps {}))
 
   (^xtdb.query.PreparedQuery [query
-                              {:keys [^IScanEmitter scan-emitter, ^BufferAllocator allocator,
-                                      ^RefCounter ref-ctr ^Watermark$Source wm-src] :as deps}
-                              {:keys [default-tz table-info]}]
+                              {:keys [^BufferAllocator allocator, ^RefCounter ref-ctr, ^Watermark$Source wm-src] :as deps}
+                              {:keys [default-tz]}]
 
    (let [conformed-query (s/conform ::lp/logical-plan query)]
      (when (s/invalid? conformed-query)
@@ -145,8 +143,6 @@
      (let [tables (filter (comp #{:scan} :op) (lp/child-exprs conformed-query))
            scan-cols (->> tables
                           (into #{} (mapcat scan/->scan-cols)))
-
-           _ (assert (or scan-emitter (empty? scan-cols)))
 
            cache (ConcurrentHashMap.)
 
@@ -161,7 +157,8 @@
          (getColumnFields [_ param-fields]
            (let [param-fields-by-name (->> param-fields
                                            (into {} (map (juxt (comp symbol #(.getName ^Field %)) identity))))
-                 {:keys [fields]} (emit-expr cache deps conformed-query scan-cols default-tz param-fields-by-name)]
+                 {:keys [fields]} (with-open [wm (.openWatermark wm-src)]
+                                    (emit-expr cache deps wm conformed-query scan-cols default-tz param-fields-by-name))]
              ;; could store column-fields in the cache/map too
              (->result-fields ordered-outer-projection fields)))
 
@@ -170,25 +167,23 @@
          (openQuery [_ {:keys [args current-time snapshot-time default-tz close-args? after-tx-id]
                         :or {default-tz default-tz
                              close-args? true}}]
-           (let [args (cond
-                        (instance? RelationReader args) args
-                        (vector? args) (vw/open-args allocator args)
-                        (nil? args) vw/empty-args
-                        :else (throw (ex-info "invalid args"
-                                              {:type (class args)})))
-                 {:keys [fields ->cursor]} (emit-expr cache deps conformed-query scan-cols default-tz (->arg-fields args))
-                 current-time (or (some-> (:current-time plan-meta) (expr->instant {:args args, :default-tz default-tz}))
-                                  (some-> current-time (expr->instant {:args args, :default-tz default-tz}))
-                                  (expr/current-time))]
+           (util/with-close-on-catch [^BufferAllocator allocator (if allocator
+                                                                   (util/->child-allocator allocator "BoundQuery/openCursor")
+                                                                   (RootAllocator.))
+                                      wm (.openWatermark wm-src)]
+             (let [args (cond
+                          (instance? RelationReader args) args
+                          (vector? args) (vw/open-args allocator args)
+                          (nil? args) vw/empty-args
+                          :else (throw (ex-info "invalid args"
+                                                {:type (class args)})))
+                   {:keys [fields ->cursor]} (emit-expr cache deps wm conformed-query scan-cols default-tz (->arg-fields args))
+                   current-time (or (some-> (:current-time plan-meta) (expr->instant {:args args, :default-tz default-tz}))
+                                    (some-> current-time (expr->instant {:args args, :default-tz default-tz}))
+                                    (expr/current-time))]
 
-             (.acquire ref-ctr)
-             (try
-               (util/with-close-on-catch [^BufferAllocator allocator
-                                          (if allocator
-                                            (util/->child-allocator allocator "BoundQuery/openCursor")
-                                            (RootAllocator.))
-                                          wm (.openWatermark wm-src)]
-
+               (.acquire ref-ctr)
+               (try
                  (binding [expr/*clock* (InstantSource/fixed current-time)
                            expr/*default-tz* default-tz
                            expr/*snapshot-time* (or (some-> (:snapshot-time plan-meta) (expr->instant {:args args, :default-tz default-tz}))
@@ -203,24 +198,24 @@
                                   :snapshot-time expr/*snapshot-time*
                                   :current-time current-time
                                   :args (or args vw/empty-args)
-                                  :schema (scan/tables-with-cols wm-src)})
+                                  :schema (some-> wm .getSchema)})
                        (wrap-cursor (->result-fields ordered-outer-projection fields)
                                     current-time expr/*snapshot-time* default-tz
-                                    allocator wm ref-ctr (when close-args? args)))))
+                                    allocator wm ref-ctr (when close-args? args))))
 
-               (catch Throwable t
-                 (.release ref-ctr)
-                 (when close-args?
-                   (util/close args))
-                 (throw t))))))))))
+                 (catch Throwable t
+                   (.release ref-ctr)
+                   (when close-args?
+                     (util/close args))
+                   (throw t)))))))))))
 
 (defmethod ig/prep-key ::query-source [_ opts]
   (merge opts
          {:plan-cache-size 1000
           :allocator (ig/ref :xtdb/allocator)
           :scan-emitter (ig/ref ::scan/scan-emitter)
-          :metadata-mgr (ig/ref ::meta/metadata-manager)
           :live-idx (ig/ref :xtdb.indexer/live-index)
+          :table-cat (ig/ref :xtdb/table-catalog)
           :metrics-registry (ig/ref :xtdb.metrics/registry)}))
 
 (defn ->caffeine-cache ^com.github.benmanes.caffeine.cache.Cache [size]
@@ -230,22 +225,13 @@
   (let [plan-cache (->caffeine-cache plan-cache-size)
         ref-ctr (RefCounter.)
         deps (-> deps (assoc :ref-ctr ref-ctr))
-        query-warning-counter ^Counter (metrics/add-counter metrics-registry "query.warning")
+        ^Counter query-warning-counter (metrics/add-counter metrics-registry "query.warning")
         allocator (util/->child-allocator allocator "query-source")]
 
     (metrics/add-allocator-gauge metrics-registry "query_source.allocator.allocated_memory" allocator)
 
     (reify
       IQuerySource
-      (prepareRaQuery [this query query-opts]
-        (.prepareRaQuery this query live-idx query-opts))
-
-      (prepareRaQuery [_ query wm-src query-opts]
-        (let [prepared-query (prepare-ra query (assoc deps :allocator allocator, :wm-src wm-src) (assoc query-opts :table-info (scan/tables-with-cols wm-src)))]
-          (when (seq (.getWarnings prepared-query))
-            (.increment query-warning-counter))
-          prepared-query))
-
       (planQuery [this query query-opts]
         (.planQuery this query live-idx query-opts))
 
@@ -273,8 +259,17 @@
                                :else (throw (err/illegal-arg :unknown-query-type {:query query, :type (type query)})))]
                     (if (or (:explain? query-opts) (:explain? (meta plan)))
                       (with-meta [:table [{:plan (with-out-str (pp/pprint plan))}]]
-                                 (-> (meta plan) (select-keys [:param-count :warnings])))
+                        (-> (meta plan) (select-keys [:param-count :warnings])))
                       plan))))))
+
+      (prepareRaQuery [this query query-opts]
+        (.prepareRaQuery this query live-idx query-opts))
+
+      (prepareRaQuery [_ query wm-src query-opts]
+        (let [prepared-query (prepare-ra query (assoc deps :allocator allocator, :wm-src wm-src) (assoc query-opts :table-info (scan/tables-with-cols wm-src)))]
+          (when (seq (.getWarnings prepared-query))
+            (.increment query-warning-counter))
+          prepared-query))
 
       AutoCloseable
       (close [_]

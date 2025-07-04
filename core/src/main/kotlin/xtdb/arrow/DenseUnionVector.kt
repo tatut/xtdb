@@ -10,6 +10,7 @@ import org.apache.arrow.vector.types.pojo.Field
 import org.apache.arrow.vector.types.pojo.FieldType
 import xtdb.api.query.IKeyFn
 import xtdb.arrow.metadata.MetadataFlavour
+import xtdb.error.Unsupported
 import xtdb.toFieldType
 import xtdb.toLeg
 import xtdb.util.Hasher
@@ -18,11 +19,22 @@ import org.apache.arrow.vector.complex.DenseUnionVector as ArrowDenseUnionVector
 
 internal val UNION_TYPE = ArrowType.Union(Dense, null)
 
-class DenseUnionVector(
+class DenseUnionVector private constructor(
     private val allocator: BufferAllocator,
-    override var name: String, legVectors: List<Vector>,
+    override var name: String, legVectors: List<Vector> = emptyList(),
+    private val typeBuffer: ExtensibleBuffer = ExtensibleBuffer(allocator),
+    private val offsetBuffer: ExtensibleBuffer = ExtensibleBuffer(allocator),
     override var valueCount: Int = 0
 ) : Vector() {
+
+    @JvmOverloads
+    constructor(
+        al: BufferAllocator, name: String, legVectors: List<Vector> = emptyList(), valueCount: Int = 0
+    ) : this(
+        al, name, legVectors,
+        ExtensibleBuffer(al), ExtensibleBuffer(al),
+        valueCount
+    )
 
     override var nullable: Boolean
         get() = false
@@ -38,23 +50,23 @@ class DenseUnionVector(
                 fromField(al, Field(vector.name, target, emptyList()))
                     .also { newVec -> repeat(vector.valueCount) { newVec.writeNull() } }
             else
-                DenseUnionVector(al, vector.name, listOf(vector), 0)
+                DenseUnionVector(al, vector.name, listOf(vector), vector.valueCount)
                     .apply {
                         vector.name = vector.fieldType.type.toLeg()
 
-                        valueCount = vector.valueCount
                         repeat(vector.valueCount) { idx ->
                             typeBuffer.writeByte(0)
                             offsetBuffer.writeInt(idx)
                         }
                     }
+                    .also { it.vectorFor(target) }
     }
 
     private val legVectors = legVectors.toMutableList()
 
     override val vectors: Iterable<Vector> get() = legVectors
 
-    private inner class LegVector(
+    internal inner class LegVector(
         private val typeId: Byte, private val inner: VectorWriter, private val nested: Boolean = false
     ) : VectorReader, VectorWriter {
 
@@ -90,7 +102,17 @@ class DenseUnionVector(
         override val mapKeys get() = inner.mapKeys
         override val mapValues get() = inner.mapValues
 
+        override fun openSlice(al: BufferAllocator) = unsupported("LegVector/openSlice")
+
         override val metadataFlavours get() = inner.metadataFlavours
+
+        override fun valueReader(pos: VectorPosition) = inner.valueReader(object : VectorPosition {
+            override var position: Int
+                get() = getOffset(pos.position)
+                set(_) {
+                    throw UnsupportedOperationException("setPosition not supported on LegVector")
+                }
+        })
 
         private fun writeValueThen(): VectorWriter {
             if (!nested) {
@@ -133,7 +155,7 @@ class DenseUnionVector(
             return RowCopier { srcIdx -> innerCopier.copyRow(getOffset(srcIdx)) }
         }
 
-        override fun rowCopier0(src: VectorReader): RowCopier {
+        fun rowCopierFrom(src: VectorReader): RowCopier {
             val innerCopier = src.rowCopier(inner)
             return RowCopier { srcIdx -> valueCount.also { writeValueThen(); innerCopier.copyRow(srcIdx) } }
         }
@@ -144,11 +166,9 @@ class DenseUnionVector(
         override fun toList() = inner.toList()
     }
 
-    private val typeBuffer = ExtensibleBuffer(allocator)
     private fun getTypeId(idx: Int) = typeBuffer.getByte(idx)
     internal fun typeIds() = (0 until valueCount).map { typeBuffer.getByte(it) }
 
-    private val offsetBuffer = ExtensibleBuffer(allocator)
     private fun getOffset(idx: Int) = offsetBuffer.getInt(idx)
     internal fun offsets() = (0 until valueCount).map { offsetBuffer.getInt(it) }
 
@@ -192,13 +212,13 @@ class DenseUnionVector(
         return null
     }
 
-    override fun vectorFor(name: String, fieldType: FieldType): VectorWriter {
+    private fun legVectorFor(name: String, fieldType: FieldType): LegVector {
         for (i in legVectors.indices) {
             val leg = legVectors[i]
             if (leg.name == name) {
-                val legFieldType = leg.field.fieldType
-                if (legFieldType.type != fieldType.type || (fieldType.isNullable && !legFieldType.isNullable))
-                    TODO("promotion")
+                val legFieldType = leg.fieldType
+                if (legFieldType.type != fieldType.type) throw Unsupported("cannot promote DUV leg")
+                leg.nullable = leg.nullable || fieldType.isNullable
 
                 return LegVector(i.toByte(), leg)
             }
@@ -208,6 +228,9 @@ class DenseUnionVector(
         val legVec = fromField(allocator, Field(name, fieldType, emptyList())).also { legVectors.add(it) }
         return LegVector(typeId, legVec)
     }
+
+    override fun vectorFor(name: String, fieldType: FieldType): VectorWriter = legVectorFor(name, fieldType)
+    fun vectorFor(fieldType: FieldType) = vectorFor(fieldType.type.toLeg(), fieldType)
 
     private fun legWriter(fieldType: FieldType) = vectorFor(fieldType.type.toLeg(), fieldType)
 
@@ -234,64 +257,47 @@ class DenseUnionVector(
         }
     }
 
-    @Suppress("CANDIDATE_CHOSEN_USING_OVERLOAD_RESOLUTION_BY_LAMBDA_ANNOTATION")
     override val metadataFlavours: Collection<MetadataFlavour>
         get() = legVectors.flatMap { it.metadataFlavours }
 
     override fun hashCode0(idx: Int, hasher: Hasher) = leg(idx)!!.hashCode(getOffset(idx), hasher)
 
     override fun rowCopier0(src: VectorReader): RowCopier =
-        when (src) {
-            is DenseUnionVector -> {
+        when {
+            src is DenseUnionVector -> {
                 val copierMapping = src.legVectors.map { childVec ->
-                    childVec.rowCopier(vectorFor(childVec.name, childVec.fieldType))
+                    childVec.rowCopier(legVectorFor(childVec.name, childVec.fieldType))
                 }
 
                 RowCopier { srcIdx ->
-                    copierMapping[src.getTypeId(srcIdx).toInt().also { check(it >= 0) }].copyRow(src.getOffset(srcIdx))
+                    val typeId = src.getTypeId(srcIdx).toInt()
+
+                    if (typeId < 0)
+                        valueCount.also { writeUndefined() }
+                    else
+                        copierMapping[typeId].copyRow(src.getOffset(srcIdx))
                 }
             }
 
-            is NullVector -> {
-                // we try to find a nullable child vector
-
-                src.rowCopier(
-                    legVectors.asSequence()
-                        .mapIndexedNotNull { idx, vector ->
-                            vector.takeIf { it.nullable }?.let { LegVector(idx.toByte(), it) }
-                        }
-                        .firstOrNull()
-                        ?: vectorFor("null", src.fieldType))
-            }
-
-            else -> {
-                vectorFor(src.fieldType.type.toLeg()).rowCopier0(src)
-            }
+            else -> src.rowCopier(legVectorFor(src.fieldType.type.toLeg(), src.fieldType))
         }
 
     override fun rowCopier(dest: VectorWriter) =
         when {
+            legVectors.size == 1 -> LegVector(0, legVectors.first()).rowCopier(dest)
 
-            dest is DenseUnionVector -> dest.rowCopier0(this).let { copier ->
+            legVectors.size == 2 && legVectors.filter { it.type == NULL_TYPE }.size == 1 -> {
+                val copier = legVectors
+                    .mapIndexed { i, v -> Pair(i, v) }
+                    .first { it.second.type != NULL_TYPE }
+                    .let { (i, v) -> LegVector(i.toByte(), v).rowCopier(dest) }
+
                 RowCopier { srcIdx ->
-                    if (getTypeId(srcIdx) < 0) valueCount.also { dest.writeUndefined() } else copier.copyRow(srcIdx)
+                    if (isNull(srcIdx)) dest.valueCount.also { dest.writeNull() } else copier.copyRow(srcIdx)
                 }
             }
 
-            legVectors.size == 2 -> {
-                require(legVectors.filter { it.type == NULL_TYPE }.size == 1)
-                val copier = legVectors.mapIndexed {i, v -> Pair(i, v)}. filter { it.second.type != NULL_TYPE }.first().let { (i, v) ->
-                    LegVector(i.toByte(), v).rowCopier(dest)
-                }
-                RowCopier { srcIdx ->
-                    if (isNull(srcIdx)) valueCount.also { dest.writeNull() } else copier.copyRow(srcIdx)
-                }
-            }
-
-            else -> {
-                require(legVectors.size == 1)
-                LegVector(0, legVectors.first()).rowCopier(dest)
-            }
+            else -> super.rowCopier(dest)
         }
 
     override fun unloadPage(nodes: MutableList<ArrowFieldNode>, buffers: MutableList<ArrowBuf>) {
@@ -325,7 +331,15 @@ class DenseUnionVector(
     }
 
     override fun openSlice(al: BufferAllocator) =
-        DenseUnionVector(al, name, legVectors.map { it.openSlice(al) }, valueCount)
+        DenseUnionVector(
+            al, name, legVectors.map { it.openSlice(al) },
+            typeBuffer.openSlice(al), offsetBuffer.openSlice(al),
+            valueCount
+        )
+
+    override fun maybePromote(al: BufferAllocator, target: FieldType) = this.also {
+        if (target.type != type) it.legWriter(target)
+    }
 
     override fun clear() {
         typeBuffer.clear()

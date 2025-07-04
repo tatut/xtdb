@@ -19,6 +19,11 @@ import org.apache.arrow.vector.types.pojo.DictionaryEncoding
 import org.apache.arrow.vector.types.pojo.Field
 import org.apache.arrow.vector.types.pojo.FieldType
 import xtdb.api.query.IKeyFn
+import xtdb.toArrowType
+import xtdb.toFieldType
+import xtdb.toLeg
+import xtdb.trie.ColumnName
+import xtdb.types.Fields
 import xtdb.util.Hasher
 import xtdb.vector.extensions.*
 import java.time.ZoneId
@@ -62,11 +67,34 @@ sealed class Vector : VectorReader, VectorWriter {
     final override fun hashCode(idx: Int, hasher: Hasher) =
         if (isNull(idx)) ArrowBufPointer.NULL_HASH_CODE else hashCode0(idx, hasher)
 
-    abstract fun openSlice(al: BufferAllocator): Vector
+    abstract override fun openSlice(al: BufferAllocator): Vector
+    override fun openDirectSlice(al: BufferAllocator) = openSlice(al)
 
     internal abstract fun unloadPage(nodes: MutableList<ArrowFieldNode>, buffers: MutableList<ArrowBuf>)
     internal abstract fun loadPage(nodes: MutableList<ArrowFieldNode>, buffers: MutableList<ArrowBuf>)
     internal abstract fun loadFromArrow(vec: ValueVector)
+
+    internal open fun maybePromote(al: BufferAllocator, target: FieldType): Vector {
+        if (target.type != type) return DenseUnionVector.promote(al, this, target)
+
+        nullable = nullable || target.isNullable
+        return this
+    }
+
+    override fun rowCopier(dest: VectorWriter): RowCopier {
+        if (dest is DenseUnionVector.LegVector) return dest.rowCopierFrom(this)
+
+        check(dest is Vector)
+
+        val copier = dest.rowCopier0(this)
+        if (!nullable) return copier
+
+        return RowCopier { idx ->
+            if (isNull(idx)) dest.valueCount.also { dest.writeNull() } else copier.copyRow(idx)
+        }
+    }
+
+    internal abstract fun rowCopier0(src: VectorReader): RowCopier
 
     override fun toList() = (0 until valueCount).map { getObject(it) }
 
@@ -90,7 +118,7 @@ sealed class Vector : VectorReader, VectorWriter {
                 override fun visit(type: ArrowType.List) =
                     ListVector(
                         al, name, isNullable,
-                        field.children.firstOrNull()?.let { fromField(al, it) } ?: NullVector("_")
+                        field.children.firstOrNull()?.let { fromField(al, it) } ?: NullVector("\$data$")
                     )
 
                 override fun visit(type: LargeList) = TODO("Not yet implemented")
@@ -98,7 +126,7 @@ sealed class Vector : VectorReader, VectorWriter {
                 override fun visit(type: FixedSizeList) =
                     FixedSizeListVector(
                         al, name, isNullable, type.listSize,
-                        field.children.firstOrNull()?.let { fromField(al, it) } ?: NullVector("_"))
+                        field.children.firstOrNull()?.let { fromField(al, it) } ?: NullVector("\$data$"))
 
                 override fun visit(type: ListView) = TODO("Not yet implemented")
                 override fun visit(type: LargeListView) = TODO("Not yet implemented")
@@ -173,14 +201,14 @@ sealed class Vector : VectorReader, VectorWriter {
                     TsTzRangeType -> TsTzRangeVector(
                         FixedSizeListVector(
                             al, name, isNullable, 2,
-                            field.children.firstOrNull()?.let { fromField(al, it) } ?: NullVector("_"))
+                            field.children.firstOrNull()?.let { fromField(al, it) } ?: NullVector("\$data$"))
                     )
 
                     SetType ->
                         SetVector(
                             ListVector(
                                 al, name, isNullable,
-                                field.children.firstOrNull()?.let { fromField(al, it) } ?: NullVector("_")))
+                                field.children.firstOrNull()?.let { fromField(al, it) } ?: NullVector("\$data$")))
 
                     else -> error("unknown extension: $type")
                 }
@@ -191,5 +219,28 @@ sealed class Vector : VectorReader, VectorWriter {
         fun fromArrow(vec: ValueVector): Vector =
             (if (vec is ArrowNullVector) NullVector(vec.name) else fromField(vec.allocator, vec.field))
                 .apply { loadFromArrow(vec) }
+
+        @JvmStatic
+        fun fromList(al: BufferAllocator, field: Field, values: List<*>): Vector {
+            var vec = fromField(al, field)
+            try {
+                for (value in values) {
+                    try {
+                        vec.writeObject(value)
+                    } catch (_: InvalidWriteObjectException) {
+                        vec = vec.maybePromote(al, value.toFieldType())
+                        vec.writeObject(value)
+                    }
+                }
+                return vec
+            } catch (t: Throwable) {
+                vec.close()
+                throw t
+            }
+        }
+
+        @JvmStatic
+        fun fromList(al: BufferAllocator, name: ColumnName, values: List<*>) =
+            fromList(al, Fields.NULL.toArrowField(name), values)
     }
 }

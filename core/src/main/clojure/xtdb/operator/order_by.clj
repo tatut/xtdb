@@ -13,15 +13,14 @@
            java.nio.file.Path
            (java.util HashMap List PriorityQueue)
            (java.util Comparator)
-           (java.util.function Consumer)
            java.util.stream.IntStream
            (org.apache.arrow.memory BufferAllocator)
            (org.apache.arrow.vector VectorSchemaRoot)
-           (org.apache.arrow.vector.ipc ArrowFileReader ArrowFileWriter ArrowReader)
+           (org.apache.arrow.vector.ipc ArrowFileReader ArrowReader)
            (org.apache.arrow.vector.types.pojo Field)
-           (xtdb.arrow Relation Relation$Loader RowCopier)
+           (xtdb.arrow Relation Relation$Loader Relation$UnloadMode RelationReader RowCopier)
            xtdb.ICursor
-           (xtdb.vector IVectorReader RelationReader RelationWriter)))
+           (xtdb.vector RelationWriter)))
 
 (s/def ::direction #{:asc :desc})
 (s/def ::null-ordering #{:nulls-first :nulls-last})
@@ -44,15 +43,11 @@
   (io/file tmp-dir (format "temp-sort-%d-%d.arrow" batch-idx file-idx)))
 
 (defn- write-rel [^BufferAllocator allocator, ^RelationReader rdr, ^OutputStream os]
-  (util/with-close-on-catch [new-vecs (vec (for [^IVectorReader col rdr]
-                                             (let [new-vec (.createVector (-> (.getField col)
-                                                                              (types/field-with-name (.getName col)))
-                                                                          allocator)]
-                                               (.copyTo col new-vec)
-                                               new-vec)))]
-    (with-open [root (VectorSchemaRoot. ^List new-vecs)]
-      (doto (ArrowFileWriter. root nil (Channels/newChannel os))
-        (.start) (.writeBatch) (.end)))))
+  (util/with-open [ch (Channels/newChannel os)
+                   rel (.openDirectSlice rdr allocator)
+                   unl (.startUnload rel ch Relation$UnloadMode/FILE)]
+    (.writePage unl)
+    (.end unl)))
 
 (defn sorted-idxs ^ints [^RelationReader read-rel, order-specs]
   (-> (IntStream/range 0 (.getRowCount read-rel))
@@ -80,9 +75,8 @@
     (if-let [filename (with-open [rel-writer (vw/->rel-writer allocator)]
                         (while (and (<= (.getRowCount rel-writer) ^int *block-size*)
                                     (.tryAdvance in-cursor
-                                                 (reify Consumer
-                                                   (accept [_ src-rel]
-                                                     (vw/append-rel rel-writer src-rel))))))
+                                                 (fn [src-rel]
+                                                   (vw/append-rel rel-writer src-rel)))))
                         (when (pos? (.getRowCount rel-writer))
                           (let [read-rel (vw/rel-wtr->rdr rel-writer)
                                 out-filename (->file tmp-dir 0 file-idx)]
@@ -125,11 +119,11 @@
                                        (catch Exception t
                                          (throw (ex-info "unable to read file" {:file-name file-name} t)))))
                                    filenames)
-                     rels (mapv #(Relation. allocator (.getSchema ^Relation$Loader %)) loaders)]
+                     rels (mapv #(Relation/open allocator (.getSchema ^Relation$Loader %)) loaders)]
 
       (let [copiers (object-array k)
             positions (int-array k)]
-        (with-open [out-rel (Relation. allocator fields)
+        (with-open [out-rel (Relation/open allocator fields)
                     out-unl (.startUnload out-rel (Channels/newChannel (io/output-stream out-file)))]
           (dotimes [i k]
             (aset copiers i (.rowCopier out-rel ^Relation (nth rels i))))
@@ -231,9 +225,8 @@
                                                               (vw/->writer (.createVector field allocator))))]
             (while (and (<= (.getRowCount rel-writer) ^int *block-size*)
                         (.tryAdvance in-cursor
-                                     (reify Consumer
-                                       (accept [_ src-rel]
-                                         (vw/append-rel rel-writer src-rel))))))
+                                     (fn [^RelationReader src-rel]
+                                       (.append rel-writer src-rel)))))
             (let [pos (.getRowCount rel-writer)
                   read-rel (vw/rel-wtr->rdr rel-writer)]
               (if (<= pos ^int *block-size*)

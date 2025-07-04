@@ -51,10 +51,10 @@
 (def ^:private dml?
   (comp #{:insert :delete :erase :merge} first))
 
-(defn- flight-stream->rows [^FlightStream flight-stream]
+(defn- flight-stream->rows [^BufferAllocator allocator, ^FlightStream flight-stream]
   (let [root (.getRoot flight-stream)
         rows (ArrayList.)]
-    (with-open [rel (Relation/fromRoot root)]
+    (with-open [rel (Relation/fromRoot allocator root)]
       (while (.next flight-stream)
         (.loadFromArrow rel root)
         (.addAll rows (.toTuples rel))))
@@ -85,12 +85,11 @@
 
                 (let [out-wtr (vw/root->writer vsr)]
                   (.forEachRemaining cursor
-                                     (reify Consumer
-                                       (accept [_ in-rel]
-                                         (.clear out-wtr)
-                                         (vw/append-rel out-wtr in-rel)
-                                         (.syncRowCount out-wtr)
-                                         (.putNext listener)))))
+                                     (fn [in-rel]
+                                       (.clear out-wtr)
+                                       (vw/append-rel out-wtr in-rel)
+                                       (.syncRowCount out-wtr)
+                                       (.putNext listener))))
 
                 (.completed listener))
               (catch Throwable t
@@ -117,7 +116,7 @@
                                    (reify BiFunction
                                      (apply [_ _ps-id {:keys [^PreparedQuery prepd-query] :as ^Map ps}]
                                        ;; TODO we likely needn't take these out and put them back.
-                                       (util/with-close-on-catch [new-args (-> (first (flight-stream->rows flight-stream))
+                                       (util/with-close-on-catch [new-args (-> (first (flight-stream->rows allocator flight-stream))
                                                                                (->> (sequence (map-indexed (fn [idx v]
                                                                                                              (-> (vw/open-vec allocator (symbol (str "?_" idx)) [v])
                                                                                                                  (vr/vec->reader))))))

@@ -7,9 +7,7 @@ import org.apache.arrow.vector.types.pojo.Field;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 import xtdb.api.query.IKeyFn;
-import xtdb.arrow.RowCopier;
-import xtdb.arrow.ValueReader;
-import xtdb.arrow.VectorPosition;
+import xtdb.arrow.*;
 import xtdb.util.Hasher;
 
 import java.nio.ByteBuffer;
@@ -17,10 +15,10 @@ import java.util.Set;
 
 public class RenamedVectorReader implements IVectorReader {
 
-    private final IVectorReader reader;
+    private final VectorReader reader;
     private final String colName;
 
-    public RenamedVectorReader(IVectorReader reader, String colName) {
+    public RenamedVectorReader(VectorReader reader, String colName) {
         this.reader = reader;
         this.colName = colName;
     }
@@ -36,7 +34,7 @@ public class RenamedVectorReader implements IVectorReader {
     }
 
     @Override
-    public IVectorReader withName(String colName) {
+    public VectorReader withName(String colName) {
         return new RenamedVectorReader(reader, colName);
     }
 
@@ -111,7 +109,7 @@ public class RenamedVectorReader implements IVectorReader {
     }
 
     @Override
-    public @Nullable IVectorReader vectorForOrNull(@NotNull String name) {
+    public @Nullable VectorReader vectorForOrNull(@NotNull String name) {
         return reader.vectorForOrNull(name);
     }
 
@@ -121,7 +119,7 @@ public class RenamedVectorReader implements IVectorReader {
     }
 
     @Override
-    public IVectorReader getListElements() {
+    public VectorReader getListElements() {
         return reader.getListElements();
     }
 
@@ -136,12 +134,12 @@ public class RenamedVectorReader implements IVectorReader {
     }
 
     @Override
-    public IVectorReader getMapKeys() {
+    public VectorReader getMapKeys() {
         return reader.getMapKeys();
     }
 
     @Override
-    public IVectorReader getMapValues() {
+    public VectorReader getMapValues() {
         return reader.getMapValues();
     }
 
@@ -156,27 +154,27 @@ public class RenamedVectorReader implements IVectorReader {
     }
 
     @Override
-    public IVectorReader copy(BufferAllocator allocator) {
-        return new RenamedVectorReader(reader.copy(allocator), colName);
+    public VectorReader openSlice(BufferAllocator allocator) {
+        return new RenamedVectorReader(reader.openSlice(allocator), colName);
     }
 
     @Override
-    public IVectorReader copyTo(ValueVector vector) {
-        return new RenamedVectorReader(reader.copyTo(vector), colName);
+    public VectorReader copyTo(ValueVector vector) {
+        return new RenamedVectorReader(((IVectorReader) reader).copyTo(vector), colName);
     }
 
     @Override
-    public IVectorReader select(int[] idxs) {
+    public VectorReader select(int[] idxs) {
         return new RenamedVectorReader(reader.select(idxs), colName);
     }
 
     @Override
-    public IVectorReader select(int startIdx, int len) {
+    public VectorReader select(int startIdx, int len) {
         return new RenamedVectorReader(reader.select(startIdx, len), colName);
     }
 
     @Override
-    public RowCopier rowCopier(IVectorWriter writer) {
+    public RowCopier rowCopier(VectorWriter writer) {
         return reader.rowCopier(writer);
     }
 

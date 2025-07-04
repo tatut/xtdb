@@ -1,9 +1,9 @@
 (ns xtdb.test-util
   (:require [clojure.spec.alpha :as s]
             [clojure.test :as t]
-            [clojure.tools.logging :as log]
             [cognitect.anomalies :as-alias anom]
             [xtdb.api :as xt]
+            [xtdb.error :as err]
             [xtdb.indexer :as idx]
             [xtdb.indexer.live-index :as li]
             [xtdb.log :as xt-log]
@@ -18,31 +18,27 @@
             [xtdb.vector.reader :as vr]
             [xtdb.vector.writer :as vw])
   (:import (clojure.lang ExceptionInfo)
-           (java.io FileOutputStream)
            java.net.ServerSocket
-           (java.nio.channels Channels)
            (java.nio.file Files Path)
            java.nio.file.attribute.FileAttribute
            (java.time Duration Instant InstantSource LocalTime Period YearMonth ZoneId ZoneOffset)
            (java.time.temporal ChronoUnit)
-           (java.util LinkedList)
-           (java.util.function Consumer IntConsumer)
+           (java.util LinkedList List)
+           (java.util.function IntConsumer)
            (java.util.stream IntStream)
            (org.apache.arrow.memory BufferAllocator RootAllocator)
            (org.apache.arrow.vector FieldVector VectorSchemaRoot)
-           (org.apache.arrow.vector.ipc ArrowFileWriter)
            (org.apache.arrow.vector.types.pojo Field Schema)
            (xtdb BufferPool ICursor)
            (xtdb.api TransactionKey)
            xtdb.api.query.IKeyFn
-           (xtdb.arrow Relation VectorReader)
+           (xtdb.arrow Relation RelationReader Vector VectorReader)
            (xtdb.indexer LiveTable Watermark Watermark$Source)
            (xtdb.log.proto TemporalMetadata TemporalMetadata$Builder)
            (xtdb.query IQuerySource PreparedQuery)
-           (xtdb.trie MetadataFileWriter Trie)
+           (xtdb.trie MetadataFileWriter)
            xtdb.types.ZonedDateTimeRange
-           (xtdb.util RefCounter RowCounter TemporalBounds TemporalDimension)
-           (xtdb.vector RelationReader)))
+           (xtdb.util RefCounter RowCounter TemporalBounds TemporalDimension)))
 
 #_{:clj-kondo/ignore [:uninitialized-var]}
 (def ^:dynamic ^org.apache.arrow.memory.BufferAllocator *allocator*)
@@ -156,11 +152,27 @@
   (li/finish-block! node))
 
 (defn open-vec
-  (^org.apache.arrow.vector.ValueVector [col-name-or-field vs]
-   (vw/open-vec *allocator* col-name-or-field vs)))
+  (^xtdb.arrow.Vector [^Field field]
+   (Vector/fromField *allocator* field))
 
-(defn open-rel ^xtdb.vector.RelationReader [vecs]
-  (vw/open-rel vecs))
+  (^xtdb.arrow.Vector [col-name-or-field ^List rows]
+   (cond
+     (string? col-name-or-field) (Vector/fromList *allocator* ^String col-name-or-field rows)
+     (instance? Field col-name-or-field) (Vector/fromList *allocator* ^Field col-name-or-field rows)
+     :else (throw (err/incorrect ::invalid-vec {:col-name-or-field col-name-or-field})))))
+
+(defn open-rel
+  (^xtdb.arrow.Relation [] (vw/open-rel *allocator*))
+
+  (^xtdb.arrow.RelationReader [rows-or-cols]
+   (cond
+     (and (map? rows-or-cols) (every? sequential? (vals rows-or-cols)))
+     (Relation/openFromCols *allocator* rows-or-cols)
+
+     (and (sequential? rows-or-cols) (every? map? rows-or-cols))
+     (Relation/openFromRows *allocator* rows-or-cols)
+
+     :else (throw (err/incorrect ::invalid-rel {:rows-or-cols rows-or-cols})))))
 
 (defn open-args ^xtdb.arrow.RelationReader [args]
   (vw/open-args *allocator* args))
@@ -315,7 +327,7 @@
      (.build builder))))
 
 (defn open-arrow-hash-trie-rel ^xtdb.arrow.Relation [^BufferAllocator al, paths]
-  (util/with-close-on-catch [meta-rel (Relation. al MetadataFileWriter/metaRelSchema)]
+  (util/with-close-on-catch [meta-rel (Relation/open al MetadataFileWriter/metaRelSchema)]
     (let [nodes-wtr (.vectorFor meta-rel "nodes")
           nil-wtr (.vectorFor nodes-wtr "nil")
           iid-branch-wtr (.vectorFor nodes-wtr "branch-iid")
@@ -352,51 +364,6 @@
         (write-paths paths)))
 
     meta-rel))
-
-(defn write-arrow-data-file ^org.apache.arrow.vector.VectorSchemaRoot
-  [^BufferAllocator al, page-idx->documents, ^Path data-file-path]
-  (letfn [(normalize-doc [doc]
-            (-> (dissoc doc :xt/system-from :xt/valid-from :xt/valid-to)
-                (update-keys util/kw->normal-form-kw)))]
-    (let [data-schema (-> page-idx->documents
-                          (->> vals (apply concat) (filter #(= :put (first %)))
-                               (map (comp types/col-type->field vw/value->col-type normalize-doc second))
-                               (apply types/merge-fields))
-                          (types/field-with-name "put"))]
-      (util/with-open [data-vsr (VectorSchemaRoot/create (Trie/dataRelSchema data-schema) al)
-                       data-wtr (vw/root->writer data-vsr)
-                       os (FileOutputStream. (.toFile data-file-path))
-                       write-ch (Channels/newChannel os)
-                       aw (ArrowFileWriter. data-vsr nil write-ch)]
-        (.start aw)
-        (let [!last-iid (atom nil)
-              iid-wtr (.vectorFor data-wtr "_iid")
-              system-from-wtr (.vectorFor data-wtr "_system_from")
-              valid-from-wtr (.vectorFor data-wtr "_valid_from")
-              valid-to-wtr (.vectorFor data-wtr "_valid_to")
-              op-wtr (.vectorFor data-wtr "op")
-              put-wtr (.vectorFor op-wtr "put")
-              max-page-id (-> (keys page-idx->documents) sort last)]
-          (doseq [i (range (inc max-page-id))]
-            (doseq [[op doc] (get page-idx->documents i)]
-              (case op
-                :put (let [iid-bytes (util/->iid (:xt/id doc))]
-                       (when (and @!last-iid (> (util/compare-nio-buffers-unsigned @!last-iid iid-bytes) 0))
-                         (log/error "IID's not in required order!" (:xt/id doc)))
-                       (.writeObject iid-wtr iid-bytes)
-                       (.writeLong system-from-wtr (or (:xt/system-from doc) 0))
-                       (.writeLong valid-from-wtr (or (:xt/valid-from doc) 0))
-                       (.writeLong valid-to-wtr (or (:xt/valid-to doc) Long/MAX_VALUE))
-                       (.writeObject put-wtr (normalize-doc doc))
-                       (.endRow data-wtr)
-                       (reset! !last-iid iid-bytes))
-                (:delete :erase) (throw (UnsupportedOperationException.))))
-            (.syncRowCount data-wtr)
-            (.writeBatch aw)
-            (.clear data-wtr)
-            (.clear data-vsr))
-          (.end aw)))
-      data-file-path)))
 
 (defn open-live-table ^xtdb.indexer.LiveTable [table-name]
   (LiveTable. *allocator* BufferPool/UNUSED table-name (RowCounter. 0)))
@@ -442,4 +409,3 @@
    (let [^PreparedQuery prepared-q (xtp/prepare-sql node query opts)]
      {:res (xt/q node query opts)
       :res-type (mapv (juxt #(.getName ^Field %) types/field->col-type) (.getColumnFields prepared-q []))})))
-

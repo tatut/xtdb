@@ -13,7 +13,6 @@ import org.apache.arrow.vector.types.pojo.Field
 import org.apache.arrow.vector.types.pojo.FieldType
 import xtdb.api.query.IKeyFn
 import xtdb.arrow.metadata.MetadataFlavour
-import xtdb.asKeyword
 import xtdb.error.Incorrect
 import xtdb.toFieldType
 import xtdb.util.Hasher
@@ -22,7 +21,8 @@ import java.util.*
 
 internal val STRUCT = ArrowType.Struct.INSTANCE
 
-class StructVector(
+class StructVector
+@JvmOverloads constructor(
     private val allocator: BufferAllocator,
     override var name: String, override var nullable: Boolean,
     private val childWriters: SequencedMap<String, Vector> = LinkedHashMap(),
@@ -49,15 +49,17 @@ class StructVector(
     override fun vectorFor(name: String) = childWriters[name] ?: error("missing child vector: $name")
 
     override fun vectorFor(name: String, fieldType: FieldType) =
-        childWriters.compute(name) { _, v ->
-            if (v == null) {
-                fromField(allocator, Field(name, fieldType, emptyList())).also { newVec ->
-                    repeat(valueCount) { if(isNull(it)) newVec.writeUndefined() else newVec.writeNull() }
-                }
-            } else {
-                val existingFieldType = v.fieldType
-                if (existingFieldType != fieldType) TODO("promotion to union")
-                v
+        childWriters.compute(name) { _, existingChild ->
+            when {
+                existingChild == null ->
+                    fromField(allocator, Field(name, fieldType, emptyList())).also { newVec ->
+                        repeat(valueCount) { if (isNull(it)) newVec.writeUndefined() else newVec.writeNull() }
+                    }
+
+                existingChild.fieldType.type != fieldType.type || (!existingChild.nullable && fieldType.isNullable) ->
+                    existingChild.maybePromote(allocator, fieldType)
+
+                else -> existingChild
             }
         }!!
 
@@ -104,11 +106,9 @@ class StructVector(
                 try {
                     childWriter.writeObject(obj)
                 } catch (e: InvalidWriteObjectException) {
-                    DenseUnionVector.promote(allocator, childWriter, e.obj.toFieldType())
-                        .apply {
-                            childWriters[key] = this
-                            writeObject(obj)
-                        }
+                    val newWriter = childWriter.maybePromote(allocator, e.obj.toFieldType())
+                    childWriters[key] = newWriter
+                    newWriter.writeObject(obj)
                 }
             }
             endStruct()
@@ -132,9 +132,17 @@ class StructVector(
         }
 
     override fun rowCopier0(src: VectorReader): RowCopier {
-        require(src is StructVector)
+        if (src.fieldType.type != type) throw InvalidCopySourceException(src.fieldType, fieldType)
+        nullable = nullable || src.nullable
+
+        check(src is StructVector)
         val childCopiers = src.childWriters.map { (childName, child) ->
-            child.rowCopier(childWriters[childName] ?: error("missing child vector: $childName"))
+            child.rowCopier(vectorFor(childName, child.fieldType))
+        }
+
+        val srcKeys = src.childWriters.keys
+        for (child in childWriters.values) {
+            if (child.name !in srcKeys) child.nullable = true
         }
 
         return RowCopier { srcIdx ->

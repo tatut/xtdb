@@ -2,8 +2,7 @@ package xtdb.vector
 
 import org.apache.arrow.memory.BufferAllocator
 import org.apache.arrow.vector.types.pojo.FieldType
-import xtdb.arrow.Relation
-import xtdb.arrow.Vector
+import xtdb.arrow.RelationReader
 
 @Suppress("unused")
 class RelationWriter(private val allocator: BufferAllocator) : IRelationWriter {
@@ -16,7 +15,7 @@ class RelationWriter(private val allocator: BufferAllocator) : IRelationWriter {
     override fun iterator() = writers.iterator()
 
     override var rowCount = 0
-    override val vectors: Iterable<IVectorWriter> get() = writers.values
+    override val vectors: Collection<IVectorWriter> get() = writers.values
 
     override fun endRow(): Int {
         val pos = rowCount++
@@ -36,9 +35,7 @@ class RelationWriter(private val allocator: BufferAllocator) : IRelationWriter {
                     writers[name] = it
                 }
 
-    override fun openAsRelation() = Relation(writers.values.map { Vector.fromArrow(it.vector) }, rowCount)
-
-    val asReader get() = RelationReader.from(vectors.map { it.asReader }, rowCount)
+    override val asReader get() = RelationReader.from(vectors.map { it.asReader }, rowCount)
 
     override fun close() {
         writers.values.forEach(IVectorWriter::close)

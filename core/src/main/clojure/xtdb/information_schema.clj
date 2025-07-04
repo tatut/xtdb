@@ -18,12 +18,11 @@
            (org.apache.arrow.vector.types.pojo Schema)
            (xtdb ICursor)
            xtdb.api.query.IKeyFn
-           (xtdb.arrow Relation VectorReader VectorWriter)
+           (xtdb.arrow Relation RelationReader VectorReader VectorWriter)
            (xtdb.indexer Watermark)
            xtdb.operator.SelectionSpec
            (xtdb.trie MemoryHashTrie Trie TrieCatalog)
-           xtdb.types.Fields
-           (xtdb.vector RelationReader)))
+           xtdb.types.Fields))
 
 (defn name->oid [s]
   (Math/abs ^Integer (hash s)))
@@ -461,9 +460,8 @@
                                                 (.getAllColumnFields)))
                             (update-keys symbol)
                             (merge meta-table-schemas))]
-        (util/with-close-on-catch [out-root (util/with-open [out-rel (Relation. ^BufferAllocator allocator
-                                                                                (Schema. (vec (vals derived-table-schema)))
-                                                                                0)]
+        (util/with-close-on-catch [out-root (util/with-open [out-rel (Relation/open ^BufferAllocator allocator
+                                                                                    (Schema. (vec (vals derived-table-schema))))]
 
                                               (.writeRows out-rel (->> (case table
                                                                          information_schema/tables (tables schema-info)

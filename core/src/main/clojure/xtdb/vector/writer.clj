@@ -7,16 +7,16 @@
            java.net.URI
            (java.nio ByteBuffer)
            (java.time Duration Instant LocalDate LocalDateTime LocalTime OffsetDateTime ZonedDateTime)
-           (java.util Date LinkedList List Map Set UUID)
+           (java.util Date List Map Set UUID)
            (org.apache.arrow.memory BufferAllocator)
            (org.apache.arrow.vector ValueVector VectorSchemaRoot)
            (org.apache.arrow.vector.types.pojo Field FieldType)
-           xtdb.arrow.Vector
+           (xtdb.arrow Relation RelationReader RelationWriter)
            xtdb.error.Anomaly
            xtdb.time.Interval
            xtdb.Types
            (xtdb.types ClojureForm ZonedDateTimeRange)
-           (xtdb.vector FieldVectorWriters IRelationWriter IVectorReader IVectorWriter RelationReader RelationWriter RootWriter)))
+           (xtdb.vector FieldVectorWriters RootWriter)))
 
 (set! *unchecked-math* :warn-on-boxed)
 
@@ -158,10 +158,10 @@
 (defn ->vec-writer ^xtdb.vector.IVectorWriter [^BufferAllocator allocator, ^String col-name, ^FieldType field-type]
   (->writer (.createNewSingleVector field-type col-name allocator nil)))
 
-(defn ->rel-writer ^xtdb.vector.IRelationWriter [^BufferAllocator allocator]
-  (RelationWriter. allocator))
+(defn ->rel-writer ^xtdb.arrow.RelationWriter [^BufferAllocator allocator]
+  (xtdb.vector.RelationWriter. allocator))
 
-(defn root->writer ^xtdb.vector.IRelationWriter [^VectorSchemaRoot root]
+(defn root->writer ^xtdb.arrow.RelationWriter [^VectorSchemaRoot root]
   (RootWriter. root))
 
 (defmulti open-vec (fn [_allocator col-name-or-field _vs]
@@ -180,47 +180,25 @@
   (util/with-close-on-catch [res (.createVector field allocator)]
     (doto res (write-vec! vs))))
 
-(defn open-rel ^xtdb.vector.RelationReader [vecs]
-  (vr/rel-reader (map vr/vec->reader vecs)))
-
-(defn- param-sym [v]
-  (-> (symbol (str "?" v))
-      util/symbol->normal-form-symbol))
-
 (defn open-args ^xtdb.arrow.RelationReader [allocator args]
   (let [args-map (->> args
                       (into {} (map-indexed (fn [idx v]
                                               (if (map-entry? v)
-                                                {(param-sym (str (symbol (key v)))) (val v)}
+                                                {(symbol (str "?" (symbol (key v)))) (val v)}
                                                 {(symbol (str "?_" idx)) v})))))]
 
-    ;; TODO this is way more general than just this function
-    ;; TODO can also move to Relation/fromMaps as and when we implement that
-    (util/with-close-on-catch [arg-vecs (LinkedList.)]
-      (doseq [[k v] args-map]
-        (let [vec (Vector/fromField allocator (types/col-type->field k (value->col-type v)))]
-          (.add arg-vecs vec)
-          (.writeObject vec v)))
+    (Relation/openFromRows allocator [args-map])))
 
-      (xtdb.arrow.RelationReader/from arg-vecs (count args-map)))))
+(def empty-args RelationReader/DUAL)
 
-(def empty-args xtdb.arrow.RelationReader/DUAL)
+(defn open-rel ^xtdb.arrow.Relation [^BufferAllocator al]
+  (Relation. al))
 
-(defn vec-wtr->rdr ^xtdb.vector.IVectorReader [^xtdb.vector.IVectorWriter w]
-  (vr/vec->reader (.getVector (doto w (.syncValueCount)))))
+(defn vec-wtr->rdr ^xtdb.arrow.VectorReader [^xtdb.arrow.VectorWriter w]
+  (.getAsReader w))
 
-(defn rel-wtr->rdr ^xtdb.vector.RelationReader [^xtdb.vector.IRelationWriter w]
-  (vr/rel-reader (map vec-wtr->rdr w) (.getRowCount w)))
+(defn rel-wtr->rdr ^xtdb.arrow.RelationReader [^xtdb.arrow.RelationWriter w]
+  (.getAsReader w))
 
-(defn append-vec [^IVectorWriter vec-writer, ^IVectorReader in-col]
-  (let [row-copier (.rowCopier in-col vec-writer)]
-    (dotimes [src-idx (.getValueCount in-col)]
-      (.copyRow row-copier src-idx))))
-
-(defn append-rel [^IRelationWriter dest-rel, ^RelationReader src-rel]
-  (doseq [^IVectorReader src-col src-rel]
-    (-> (or (.vectorForOrNull dest-rel (.getName src-col))
-            (.vectorFor dest-rel (.getName src-col) (.getFieldType src-col)))
-        (append-vec src-col)))
-
-  (.setRowCount dest-rel (+ (.getRowCount dest-rel) (.getRowCount src-rel))))
+(defn append-rel [^RelationWriter dest-rel, ^RelationReader src-rel]
+  (.append dest-rel src-rel))

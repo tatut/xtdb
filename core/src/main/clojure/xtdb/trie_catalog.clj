@@ -17,8 +17,11 @@
            (xtdb.util TemporalBounds)))
 
 ;; table-tries data structure
-;; values :: {:keys [level recency part block-idx state]}
-;;   sorted by block-idx desc (except L1H)
+;; values is a map of live+nascent and garbage tries
+;; tries :: {:keys [level recency part block-idx state]}
+;;   sorted by block-idx desc
+;;   this is true of the live+nascent tries, and the garbage tries
+;;   for correctness it's important that these invariants are maintained when a trie switches state
 ;; part :: [long]
 ;; recency :: LocalDate
 '{;; L0 files
@@ -77,8 +80,8 @@
         (concat (persistent! res) coll))
       (concat (persistent! res) coll))))
 
-(defn- stale-block-idx? [{:keys [live+nascent] :as _tries} ^long block-idx]
-  (when-let [{^long other-block-idx :block-idx} (first live+nascent)]
+(defn- stale-block-idx? [{:keys [live+nascent garbage] :as _tries} ^long block-idx]
+  (when-let [{^long other-block-idx :block-idx} (or (first live+nascent) (first garbage))]
     (>= other-block-idx block-idx)))
 
 (defn stale-msg?
@@ -228,7 +231,7 @@
                       (filter #(= (:state %) :live))))))
 
 (defn all-tries [{:keys [tries]}]
-  (->> (into [] (mapcat (comp (fn [{:keys [live+nascent garbage]}] (concat live+nascent garbage))  val)) tries)
+  (->> (into [] (mapcat (comp (fn [{:keys [live+nascent garbage]}] (concat live+nascent garbage)) val)) tries)
        ;; the sort is needed as the table blocks need the current tries to be in the total order for restart
        (sort-by (juxt :level :block-idx #(or (:recency %) LocalDate/MAX)))))
 

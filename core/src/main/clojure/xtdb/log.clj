@@ -120,8 +120,10 @@
           (doseq [doc docs
                   :let [eid (val (or (->> doc
                                           (some (fn [e]
-                                                  (when (.equals "_id" (util/->normal-form-str (key e)))
-                                                    e))))
+                                                  (let [k (key e)]
+                                                    (when (.equals "_id" (cond-> k
+                                                                           (keyword? k) util/->normal-form-str))
+                                                      e)))))
                                      (throw (err/illegal-arg :missing-id {:doc doc}))))]]
             (.writeBytes iid-writer (util/->iid eid)))
           (.endList iids-writer))
@@ -204,7 +206,7 @@
 
 (defn serialize-tx-ops ^java.nio.ByteBuffer [^BufferAllocator allocator tx-ops {:keys [^Instant system-time, default-tz]
                                                                                 {:keys [user]} :authn :as opts}]
-  (with-open [rel (Relation. allocator tx-schema)]
+  (with-open [rel (Relation/open allocator tx-schema)]
     (let [ops-list-writer (.get rel "tx-ops")
 
           default-tz-writer (.get rel "default-tz")

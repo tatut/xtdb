@@ -12,6 +12,9 @@ import xtdb.arrow.RowCopier
 import xtdb.arrow.ValueReader
 import xtdb.arrow.VectorIndirection
 import xtdb.arrow.VectorPosition
+import xtdb.arrow.VectorReader
+import xtdb.arrow.VectorWriter
+import xtdb.arrow.unsupported
 import xtdb.toLeg
 import xtdb.util.Hasher
 import xtdb.util.requiringResolve
@@ -20,13 +23,13 @@ import java.util.concurrent.ConcurrentHashMap
 
 class IndirectMultiVectorReader(
     override val name: String,
-    private val readers: List<IVectorReader?>,
+    private val readers: List<VectorReader?>,
     private val readerIndirection: VectorIndirection,
     private val vectorIndirections: VectorIndirection,
 ) : IVectorReader {
 
     private val fields: List<Field?> = readers.map { it?.field }
-    private val legReaders = ConcurrentHashMap<String, IVectorReader>()
+    private val legReaders = ConcurrentHashMap<String, VectorReader>()
     private val vectorField by lazy(LazyThreadSafetyMode.PUBLICATION) {
         MERGE_FIELDS.applyTo(RT.seq(fields.filterNotNull())) as Field
     }
@@ -43,7 +46,7 @@ class IndirectMultiVectorReader(
         throw UnsupportedOperationException("IndirectMultiVectoReader")
     }
 
-    private fun safeReader(idx: Int): IVectorReader {
+    private fun safeReader(idx: Int): VectorReader {
         return readers[readerIndirection[idx]] ?: throw unsupported()
     }
 
@@ -91,7 +94,7 @@ class IndirectMultiVectorReader(
     private fun range(start: Int, len: Int): IntArray = IntArray(len) { it + start }
     private fun repeat(len: Int, item: Int): IntArray = IntArray(len) { item }
 
-    override val listElements: IVectorReader
+    override val listElements: VectorReader
         get() {
             val listElementReaders = readers.map { it?.listElements }
             var readerIndirectionArray = intArrayOf()
@@ -116,10 +119,10 @@ class IndirectMultiVectorReader(
 
     override fun getListCount(idx: Int): Int = safeReader(idx).getListCount(vectorIndirections[idx])
 
-    override val mapKeys: IVectorReader
+    override val mapKeys: VectorReader
         get() = IndirectMultiVectorReader("key", readers.map { it?.mapKeys }, readerIndirection, vectorIndirections)
 
-    override val mapValues: IVectorReader
+    override val mapValues: VectorReader
         get() = IndirectMultiVectorReader("value", readers.map { it?.mapValues }, readerIndirection, vectorIndirections)
 
     override fun getLeg(idx: Int): String? {
@@ -130,21 +133,21 @@ class IndirectMultiVectorReader(
         }
     }
 
-    override fun vectorForOrNull(legKey: String): IVectorReader {
-        return legReaders.computeIfAbsent(legKey) {
+    override fun vectorForOrNull(name: String): VectorReader {
+        return legReaders.computeIfAbsent(name) {
             val validReaders = readers.zip(fields).map { (reader, field) ->
                 if (reader == null) null
                 else when (field!!.fieldType.type) {
-                    is ArrowType.Union -> reader.vectorFor(legKey)
+                    is ArrowType.Union -> reader.vectorFor(name)
                     else -> {
-                        if (field.fieldType.type.toLeg() == legKey) reader
+                        if (field.fieldType.type.toLeg() == name) reader
                         else null
                     }
                 }
             }
 
             IndirectMultiVectorReader(
-                legKey,
+                name,
                 validReaders,
                 object : VectorIndirection {
                     override fun valueCount(): Int {
@@ -174,7 +177,7 @@ class IndirectMultiVectorReader(
                 }
             }.toSet()
 
-    override fun copyTo(vector: ValueVector): IVectorReader {
+    override fun copyTo(vector: ValueVector): VectorReader {
         val writer = writerFor(vector)
         val copier = rowCopier(writer)
 
@@ -186,10 +189,12 @@ class IndirectMultiVectorReader(
         return ValueVectorReader.from(vector)
     }
 
-    override fun rowCopier(writer: IVectorWriter): RowCopier {
-        readers.map { it?.also { writer.promoteChildren(it.field) } }
+    override fun rowCopier(dest: VectorWriter): RowCopier {
+        if (dest !is IVectorWriter) unsupported("IndirectMultiVectorReader.rowCopier(VectorWriter)")
+
+        readers.map { it?.also { dest.promoteChildren(it.field) } }
         val rowCopiers =
-            readers.map { it?.rowCopier(writer) ?: ValueVectorReader(NullVector(it?.name)).rowCopier(writer) }
+            readers.map { it?.rowCopier(dest) ?: ValueVectorReader(NullVector(it?.name)).rowCopier(dest) }
         return RowCopier { sourceIdx -> rowCopiers[readerIndirection[sourceIdx]].copyRow(vectorIndirections[sourceIdx]) }
     }
 

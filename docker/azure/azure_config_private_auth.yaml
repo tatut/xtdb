@@ -1,4 +1,5 @@
 server:
+  host: '*'
   port: 5432
 
 log: !Kafka
@@ -15,11 +16,15 @@ storage: !Remote
     container: !Env XTDB_AZURE_STORAGE_CONTAINER
     prefix: "xtdb-object-store"
     userManagedIdentityClientId: !Env XTDB_AZURE_USER_MANAGED_IDENTITY_CLIENT_ID
-  localDiskCache: !Env XTDB_LOCAL_DISK_CACHE
+
+diskCache:
+  path: !Env XTDB_LOCAL_DISK_CACHE
 
 healthz:
+  host: '*'
   port: 8080
 
 modules:
 - !HttpServer
+  host: '*'
   port: 3000

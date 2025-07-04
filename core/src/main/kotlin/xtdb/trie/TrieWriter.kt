@@ -4,6 +4,7 @@ import org.apache.arrow.memory.BufferAllocator
 import org.apache.arrow.memory.util.ArrowBufPointer
 import xtdb.BufferPool
 import xtdb.arrow.Relation
+import xtdb.arrow.RelationReader
 import xtdb.arrow.VectorReader
 import xtdb.compactor.PageTree
 import xtdb.log.proto.TrieMetadata
@@ -16,7 +17,7 @@ class TrieWriter(
     private val calculateBlooms: Boolean
 ) {
 
-    fun writeLiveTrie(tableName: TableName, trieKey: TrieKey, trie: MemoryHashTrie, dataRel: Relation): FileSize =
+    fun writeLiveTrie(tableName: TableName, trieKey: TrieKey, trie: MemoryHashTrie, dataRel: RelationReader): FileSize =
         DataFileWriter(al, bp, tableName, trieKey, dataRel.schema).use { dataFileWriter ->
             MetadataFileWriter(al, bp, tableName, trieKey, dataFileWriter.dataRel, calculateBlooms, false)
                 .use { metaFileWriter ->
@@ -88,7 +89,7 @@ class TrieWriter(
 
             MetadataFileWriter(al, bp, tableName, trieKey, dataFileWriter.dataRel, calculateBlooms, true)
                 .use { metaFileWriter ->
-                    Relation(al, loader.schema).use { inRel ->
+                    Relation.open(al, loader.schema).use { inRel ->
                         val iidReader = inRel["_iid"]
 
                         fun Selection.soloIid(): Boolean =
